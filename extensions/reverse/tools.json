@@ -1,0 +1,39 @@
+{
+  "tools": [
+    {
+      "name": "ida-pro",
+      "description": "IDA Pro 无头反编译、函数符号与交叉引用分析 MCP 服务（按会话工作区隔离）",
+      "startCommand": "uvx ida-pro-mcp --headless --input ${targetPath}",
+      "env": {
+        "IDAUSR": "${toolDir}",
+        "PI_CYBER_SESSION_ID": "${sessionId}",
+        "PI_CYBER_WORKSPACE": "${workspaceDir}"
+      },
+      "autoStart": false,
+      "mcp": {
+        "exposure": "direct",
+        "timeout": 30000
+      }
+    },
+    {
+      "name": "ghidra",
+      "description": "Ghidra 静态反编译、函数符号与交叉引用分析 MCP 服务",
+      "startCommand": "uvx ghidra-mcp",
+      "autoStart": false,
+      "mcp": {
+        "exposure": "direct",
+        "timeout": 30000
+      }
+    },
+    {
+      "name": "radare2",
+      "description": "radare2 / r2pipe 二进制检查、反汇编与段信息分析 MCP 服务",
+      "startCommand": "npx -y r2mcp",
+      "autoStart": false,
+      "mcp": {
+        "exposure": "direct",
+        "timeout": 30000
+      }
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+{
+  "name": "pi-cyber",
+  "version": "0.1.0",
+  "description": "Modular cybersecurity Pi package with working modes for pentest, reverse engineering, attribution, and remediation.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "cybersecurity",
+    "pentest",
+    "reverse-engineering",
+    "attribution",
+    "remediation"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/core/index.ts",
+      "./extensions/pentest/index.ts",
+      "./extensions/reverse/index.ts",
+      "./extensions/attribution/index.ts",
+      "./extensions/remediation/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ],
+    "prompts": [
+      "./prompts/*.md"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  }
+}
