@@ -1,9 +1,13 @@
-import { basename } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
+  type AutocompleteProviderFactory,
   type ExtensionAPI,
   type ExtensionCommandContext,
   type ExtensionContext,
+  formatSkillsForPrompt,
   isToolCallEventType,
+  loadSkillsFromDir,
 } from "@earendil-works/pi-coding-agent";
 import {
   showCyberModeSelector,
@@ -12,11 +16,14 @@ import {
 import {
   CYBER_MODES,
   CYBER_MODE_EVENT,
+  CYBER_ONLY_COMMANDS,
   CYBER_STATUS_KEY,
   CYBER_WORKSPACE_EVENT,
+  isCyberModeActive,
   isCyberModeId,
   setCyberStatusLabel,
   switchCyberMode,
+  syncCyberToolSurface,
   type CyberModeId,
 } from "../../src/shared/mode.ts";
 import {
@@ -36,6 +43,31 @@ import {
 } from "../../src/shared/workspace.ts";
 
 const PATH_REDIRECT_TOOLS = new Set(["read", "write", "edit", "ls", "find", "grep"]);
+const SKILLS_DIR = join(dirname(fileURLToPath(import.meta.url)), "../../skills");
+const CYBER_ONLY_COMMAND_NAMES = new Set<string>(CYBER_ONLY_COMMANDS);
+
+function isCyberOnlySuggestion(value: string): boolean {
+  if (CYBER_ONLY_COMMAND_NAMES.has(value)) return true;
+  return value.startsWith("skill:pentest")
+    || value.startsWith("skill:reverse")
+    || value.startsWith("skill:attribution")
+    || value.startsWith("skill:remediation");
+}
+
+const hideCyberCommands: AutocompleteProviderFactory = (provider) => {
+  return {
+    triggerCharacters: provider.triggerCharacters,
+    getSuggestions: async (lines, cursorLine, cursorCol, options) => {
+      const result = await provider.getSuggestions(lines, cursorLine, cursorCol, options);
+      if (!result || isCyberModeActive()) return result;
+      const items = result.items.filter((item) => !isCyberOnlySuggestion(item.value));
+      return items.length === result.items.length ? result : { ...result, items };
+    },
+    applyCompletion: (lines, cursorLine, cursorCol, item, prefix) =>
+      provider.applyCompletion(lines, cursorLine, cursorCol, item, prefix),
+    shouldTriggerFileCompletion: provider.shouldTriggerFileCompletion?.bind(provider),
+  };
+}
 
 /**
  * Core extension: unified `/cyber` workspace control + cross-mode path redirect / prompt.
@@ -44,6 +76,7 @@ export default function (pi: ExtensionAPI) {
   let activeWorkspace: CyberWorkspaceState | null = null;
   let activeMode: CyberModeId | null = null;
   let lastCtx: ExtensionContext | null = null;
+  let commandFilterInstalled = false;
 
   const bindWorkspace = (ctx: ExtensionContext, workspace: CyberWorkspaceState, persist: boolean) => {
     activeWorkspace = workspace;
@@ -109,6 +142,10 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     lastCtx = ctx;
+    if (!commandFilterInstalled && ctx.hasUI) {
+      commandFilterInstalled = true;
+      ctx.ui.addAutocompleteProvider(hideCyberCommands);
+    }
     reconstructWorkspace(ctx);
     if (activeWorkspace && activeWorkspace.workspaceDir === ctx.cwd) {
       const manifest = readManifest(activeWorkspace.workspaceDir);
@@ -125,6 +162,7 @@ export default function (pi: ExtensionAPI) {
         );
       }
     }
+    syncCyberToolSurface(pi);
   });
 
   pi.on("session_tree", async (_event, ctx) => {
@@ -137,9 +175,17 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (event) => {
-    if (!activeWorkspace) return;
-    event.systemPromptOptions.sections["cyber-workspace"] =
-      formatWorkspacePromptSection(activeWorkspace);
+    if (activeWorkspace) {
+      event.systemPromptOptions.sections["cyber-workspace"] =
+        formatWorkspacePromptSection(activeWorkspace);
+    }
+    if (!activeMode) return;
+    const loaded = loadSkillsFromDir({
+      dir: join(SKILLS_DIR, activeMode),
+      source: "pi-cyber",
+    });
+    if (loaded.skills.length === 0) return;
+    event.systemPromptOptions.sections["cyber-skills"] = formatSkillsForPrompt(loaded.skills, "read");
   });
 
   pi.on("tool_call", async (event, ctx) => {

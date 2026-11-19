@@ -47,9 +47,9 @@ pi-cyber/
 | `/cyber <任务名>` | 直接创建工作区并迁移会话 |
 | `/cyber pentest\|reverse\|...` | 在当前工作区内切换模式 |
 | `/cyber off` | 退出工作模式（保留目录） |
-| `/pentest` / `/reverse` / … | 切换模式；逆向可用 `/reverse <路径>` 自动建区并登记目标 |
-| `/runtime` | 打开与 model 同风格的执行环境选择器（全局默认 + 工作区覆盖）；渗透模式下劫持 bash / `!` |
-| `/reverse-tools` | 管理逆向 MCP（IDA / Ghidra 等）；渗透侧扫描改走远程 runtime 的 bash |
+| `/pentest` / `/reverse` / … | 已进入工作模式后切换；模式外不可用 |
+| `/runtime` | 已进入工作模式后选择执行环境；渗透模式下劫持 bash / `!` |
+| `/reverse-tools` | 已进入工作模式后管理逆向 MCP（IDA / Ghidra 等） |
 
 ## 渗透模式要点
 

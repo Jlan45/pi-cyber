@@ -11,6 +11,50 @@ export type CyberModeId = "pentest" | "reverse" | "attribution" | "remediation";
 /** Tracks last broadcast mode so re-entry to the same mode skips the boot animation. */
 let lastBroadcastMode: CyberModeId | null = null;
 
+/** Slash commands that stay hidden until a working mode is active. `/cyber` is the only entry. */
+export const CYBER_ONLY_COMMANDS = [
+  "pentest",
+  "reverse",
+  "attribution",
+  "remediation",
+  "runtime",
+  "pentest-tools",
+  "reverse-tools",
+] as const;
+
+/** LLM tools declared only while a working mode is active. */
+export const CYBER_ONLY_TOOLS = [
+  "pentest_set_scope",
+  "pentest_check_scope",
+  "pentest_add_target",
+  "pentest_tool",
+  "pentest_set_execution",
+  "reverse_add_target",
+  "reverse_tool",
+  "ghidra_wait_ready",
+] as const;
+
+export function isCyberModeActive(): boolean {
+  return lastBroadcastMode !== null;
+}
+
+export function refuseOutsideCyberMode(ctx: { ui: { notify: (message: string, type?: "info" | "warning" | "error") => void } }): boolean {
+  if (isCyberModeActive()) return false;
+  ctx.ui.notify("请使用 /cyber 进入工作模式。", "warning");
+  return true;
+}
+
+/** Show or hide cyber tools in the model tool list. Other active tools stay as they are. */
+export function syncCyberToolSurface(pi: ExtensionAPI): void {
+  const active = new Set(pi.getActiveTools());
+  const enabled = isCyberModeActive();
+  for (const name of CYBER_ONLY_TOOLS) {
+    if (enabled) active.add(name);
+    else active.delete(name);
+  }
+  pi.setActiveTools([...active]);
+}
+
 export interface CyberModeMeta {
   id: CyberModeId;
   label: string;
@@ -85,6 +129,7 @@ export function registerModeModule(
   pi.registerCommand(meta.command, {
     description: meta.description,
     handler: async (args, ctx) => {
+      if (refuseOutsideCyberMode(ctx)) return;
       await switchCyberMode(pi, ctx, meta.id, options?.resolveSwitchOptions?.(args, ctx));
       await options?.onCommand?.(args, ctx);
     },
@@ -119,6 +164,7 @@ export async function switchCyberMode(
   if (mode === null) {
     applyCyberEditorStyle(ctx, false);
     ctx.ui.setStatus(CYBER_STATUS_KEY, undefined);
+    syncCyberToolSurface(pi);
     if (!options?.silent) {
       ctx.ui.notify("已退出网络安全工作模式", "info");
     }
@@ -144,6 +190,8 @@ export async function switchCyberMode(
       }
     }
   }
+
+  syncCyberToolSurface(pi);
 
   if (!options?.silent) {
     ctx.ui.notify(`已切换至「${meta.label}」工作模式`, "info");

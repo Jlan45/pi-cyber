@@ -26,9 +26,6 @@
       "./extensions/attribution/index.ts",
       "./extensions/remediation/index.ts"
     ],
-    "skills": [
-      "./skills"
-    ],
     "prompts": [
       "./prompts/*.md"
     ]

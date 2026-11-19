@@ -10,6 +10,7 @@ import {
   CYBER_MODE_EVENT,
   CYBER_MODES,
   CYBER_WORKSPACE_EVENT,
+  refuseOutsideCyberMode,
   registerModeModule,
   switchCyberMode,
 } from "../../src/shared/mode.ts";
@@ -137,6 +138,7 @@ export default function (pi: ExtensionAPI) {
     (api, modeCtx) => {
       api.registerTool({
         name: "reverse_add_target",
+        defaultActive: false,
         label: "Add Reverse Target",
         description:
           "将待逆向的二进制文件或目录包复制到当前 Cyber 工作区的 targets/ 并登记，供逆向工具使用。",
@@ -178,6 +180,7 @@ export default function (pi: ExtensionAPI) {
 
       api.registerTool({
         name: "reverse_tool",
+        defaultActive: false,
         label: "Reverse Tool Lifecycle",
         description:
           "归一化管理插件配置的逆向工具（如 Ghidra、IDA Pro、Rizin 等）：status / start / stop / reload。",
@@ -266,6 +269,7 @@ export default function (pi: ExtensionAPI) {
 
       api.registerTool({
         name: "ghidra_wait_ready",
+        defaultActive: false,
         label: "Wait Ghidra Analysis",
         description:
           "阻塞等待当前 Ghidra headless 初步自动分析完成。遇到 MCP [NOT_READY]/analyzing 时调用一次；完成后返回 get_program_info。不要改让用户干等。",
@@ -367,6 +371,7 @@ export default function (pi: ExtensionAPI) {
         description:
           "管理逆向工具 MCP 注入: /reverse-tools [status | start <name> | stop <name> | reload [name]]",
         handler: async (args, ctx) => {
+          if (refuseOutsideCyberMode(ctx)) return;
           const [sub = "status", name] = args.trim().split(/\s+/);
           const runtimeCtx = buildToolRuntimeContext(ctx);
           try {
