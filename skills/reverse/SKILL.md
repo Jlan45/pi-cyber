@@ -19,7 +19,7 @@ description: 逆向模式主流程。拿到样本后按类型路由到 Ghidra、
 |------|--------|------------|
 | ELF / PE / Mach-O / .so | `ghidra` | 等分析完成后 `get_program_info`，再反编译关键函数 |
 | 只要快速看函数、导入、字符串 | `rizin` | 打开目标做侦察；深挖再切 Ghidra |
-| 已有 IDA | `ida-pro` | 仅当本机 IDA MCP 可用 |
+| 已有 IDA 9.4+ | `ida-pro` | 官方 Hex-Rays MCP。启动时已打开样本。先 `reference` 查 API，再用 `execute_python` 反编译和查交叉引用 |
 | APK / DEX / JAR 的 Java | `jadx` | `load_apk` 后读类和方法 |
 | APK 的 manifest / smali / 资源 | `apk` | `decode_apk` 到 `.cyber-tools/apk/workspace` |
 | IPA / `.app` | `ipa` | `parse_ipa_tool` 或 `full_static_analysis` |

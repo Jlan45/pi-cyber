@@ -411,7 +411,7 @@ export default function (pi: ExtensionAPI) {
           "- 若本回合已经结束，插件会自动发起下一回合，要求调用 `ghidra_wait_ready` 后继续。",
           "- 工程目录持久化在 `.cyber-tools/ghidra/projects/<targetName>/`；同一样本再次启动通常可复用已分析结果。",
           "按样本类型选择 MCP（都需先 `/reverse-tools start <name>`，默认不自动启动）：",
-          "- 原生二进制（ELF/PE/Mach-O）：ghidra、rizin 或 ida-pro。",
+          "- 原生二进制（ELF/PE/Mach-O）：ghidra、rizin 或 ida-pro。ida-pro 是官方 Hex-Rays MCP，启动时已打开样本；用 reference 查 API，用 execute_python 做反编译，不要找社区版的 decompile 工具。",
           "- Android APK：apk 看 smali/manifest/资源；jadx 看 Java 反编译（启动后调用 load_apk，path 传 APK）。",
           "- iOS IPA 或 .app：ipa。用 parse_ipa_tool 或 full_static_analysis，参数 path 传目标路径。",
         ].join("\n");

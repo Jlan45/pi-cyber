@@ -2,17 +2,16 @@
   "tools": [
     {
       "name": "ida-pro",
-      "description": "IDA Pro 无头反编译、函数符号与交叉引用分析 MCP 服务（按会话工作区隔离）",
-      "startCommand": "uvx ida-pro-mcp --headless --input ${targetPath}",
+      "description": "官方 Hex-Rays IDA MCP（stdio）。启动时打开已登记样本。",
+      "startCommand": "\"${path:uvx}\" --python 3.12 ida-mcp==20261028.0.3 stdio --agent=pi-cyber --database \"${targetPath}\"",
       "env": {
-        "IDAUSR": "${toolDir}",
         "PI_CYBER_SESSION_ID": "${sessionId}",
         "PI_CYBER_WORKSPACE": "${workspaceDir}"
       },
       "autoStart": false,
       "mcp": {
         "exposure": "direct",
-        "timeout": 30000
+        "timeout": 600000
       }
     },
     {
