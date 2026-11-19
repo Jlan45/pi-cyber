@@ -20,6 +20,7 @@ import {
   type CyberToolRuntimeContext,
   type CyberToolStatusInfo,
 } from "../../src/shared/tools.ts";
+import { playCyberEnterAnimation } from "../../src/shared/enter-animation.ts";
 import {
   CYBER_WORKSPACE_ENTRY_TYPE,
   addTargetToWorkspace,
@@ -30,6 +31,7 @@ import {
   readManifest,
   reconstructWorkspaceFromSession,
   sanitizeWorkspaceName,
+  updateManifestActiveMode,
   type CyberWorkspaceState,
 } from "../../src/shared/workspace.ts";
 
@@ -116,12 +118,11 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("mcp_servers_change", async (_event, ctx) => {
     lastCtx = ctx;
-    if (
-      activeWorkspace?.workspaceDir === ctx.cwd ||
-      toolManager.getStatusList().some((t) => t.mcpRegistered)
-    ) {
-      updateToolsStatusUI(ctx);
-    }
+    // Registration is not connection — wait for Pi to finish connect/fail, then sync lights.
+    toolManager.scheduleReconcile(() => {
+      if (lastCtx) updateToolsStatusUI(lastCtx);
+    });
+    updateToolsStatusUI(ctx);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
@@ -146,10 +147,11 @@ export default function (pi: ExtensionAPI) {
         }),
         async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
           if (!modeCtx.isActive()) {
-            switchCyberMode(api, ctx, "reverse", {
+            await switchCyberMode(api, ctx, "reverse", {
               engagementName: activeWorkspace
                 ? basename(activeWorkspace.workspaceDir)
                 : undefined,
+              skipAnimation: true,
             });
           }
           const workspace = requireWorkspace();
@@ -178,7 +180,7 @@ export default function (pi: ExtensionAPI) {
         name: "reverse_tool",
         label: "Reverse Tool Lifecycle",
         description:
-          "归一化管理插件配置的逆向工具（如 Ghidra、IDA Pro、radare2 等）：status / start / stop / reload。",
+          "归一化管理插件配置的逆向工具（如 Ghidra、IDA Pro、Rizin 等）：status / start / stop / reload。",
         parameters: Type.Object({
           action: Type.Union(
             [
@@ -230,6 +232,137 @@ export default function (pi: ExtensionAPI) {
         },
       });
 
+      let ghidraNotReady = false;
+      let ghidraAutoResumeSent = false;
+      let ghidraWaitInProgress = false;
+
+      const GHIDRA_PROBE_TOOL = "mcp__ghidra__get_program_info";
+
+      const textOf = (content: { type: string; text?: string }[]): string =>
+        content
+          .filter((part) => part.type === "text" && typeof part.text === "string")
+          .map((part) => part.text ?? "")
+          .join("\n");
+
+      const looksNotReady = (text: string): boolean =>
+        /NOT_READY|\(analyzing\)|still analyzing/i.test(text);
+
+      const sleep = (ms: number, signal?: AbortSignal) =>
+        new Promise<void>((resolve, reject) => {
+          if (signal?.aborted) {
+            reject(new Error("aborted"));
+            return;
+          }
+          const timer = setTimeout(() => {
+            signal?.removeEventListener("abort", onAbort);
+            resolve();
+          }, ms);
+          const onAbort = () => {
+            clearTimeout(timer);
+            reject(new Error("aborted"));
+          };
+          signal?.addEventListener("abort", onAbort, { once: true });
+        });
+
+      api.registerTool({
+        name: "ghidra_wait_ready",
+        label: "Wait Ghidra Analysis",
+        description:
+          "阻塞等待当前 Ghidra headless 初步自动分析完成。遇到 MCP [NOT_READY]/analyzing 时调用一次；完成后返回 get_program_info。不要改让用户干等。",
+        parameters: Type.Object({
+          timeout_sec: Type.Optional(
+            Type.Number({
+              description: "最长等待秒数，默认 1800，最大 3600",
+              minimum: 30,
+              maximum: 3600,
+            }),
+          ),
+        }),
+        async execute(_toolCallId, params, signal, onUpdate, ctx) {
+          if (!modeCtx.isActive()) {
+            throw new Error("请先进入逆向模式（/reverse）并启动 ghidra MCP。");
+          }
+          const timeoutMs = Math.min(Math.max((params.timeout_sec ?? 1800) * 1000, 30_000), 3_600_000);
+          const started = Date.now();
+          let interval = 8_000;
+          ghidraWaitInProgress = true;
+          try {
+            const probeName =
+              ctx.tools?.find((tool) => tool.name === GHIDRA_PROBE_TOOL)?.name ??
+              ctx.tools?.find(
+                (tool) =>
+                  tool.name.startsWith("mcp__ghidra__") && tool.name.includes("get_program_info"),
+              )?.name ??
+              GHIDRA_PROBE_TOOL;
+
+            while (Date.now() - started < timeoutMs) {
+              if (signal?.aborted) throw new Error("aborted");
+              const outcome = await ctx.executeTool(probeName, {});
+              const text = textOf(outcome.result?.content ?? []);
+              const missing =
+                outcome.isError &&
+                /unknown tool|disabled|no longer available|still starting/i.test(text);
+              if (missing) {
+                throw new Error("Ghidra MCP 未就绪。请先 /reverse-tools start ghidra（需已登记 target）。");
+              }
+              if (text && !looksNotReady(text) && !outcome.isError) {
+                ghidraNotReady = false;
+                ghidraAutoResumeSent = false;
+                return {
+                  content: [
+                    {
+                      type: "text" as const,
+                      text: `Ghidra 初步分析已完成（等待 ${Math.round((Date.now() - started) / 1000)}s）。\n${text}`,
+                    },
+                  ],
+                  details: { ready: true, elapsedMs: Date.now() - started },
+                };
+              }
+              const elapsed = Math.round((Date.now() - started) / 1000);
+              onUpdate?.({
+                content: [{ type: "text", text: `Ghidra 分析中… ${elapsed}s` }],
+                details: { ready: false, elapsedMs: Date.now() - started },
+              });
+              await sleep(interval, signal);
+              interval = Math.min(interval + 2_000, 20_000);
+            }
+            throw new Error(
+              `等待 Ghidra 初步分析超时（${Math.round(timeoutMs / 1000)}s）。可再次调用 ghidra_wait_ready。`,
+            );
+          } finally {
+            ghidraWaitInProgress = false;
+          }
+        },
+      });
+
+      api.on("tool_result", async (event) => {
+        if (!modeCtx.isActive()) return;
+        if (!event.toolName.startsWith("mcp__ghidra__")) return;
+        const text = textOf(event.content);
+        if (!looksNotReady(text)) return;
+        ghidraNotReady = true;
+        ghidraAutoResumeSent = false;
+        return {
+          content: [
+            ...event.content,
+            {
+              type: "text" as const,
+              text: "\n[pi-cyber] 分析尚未完成。请立刻调用 ghidra_wait_ready，不要结束本回合，也不要询问用户是否继续。",
+            },
+          ],
+        };
+      });
+
+      api.on("agent_end", async () => {
+        if (!modeCtx.isActive()) return;
+        if (!ghidraNotReady || ghidraAutoResumeSent || ghidraWaitInProgress) return;
+        ghidraAutoResumeSent = true;
+        pi.sendUserMessage(
+          "Ghidra 仍在自动分析。请调用 ghidra_wait_ready 直到初步分析完成，然后从上次中断处继续逆向，不要再向用户确认。",
+          { deliverAs: "followUp" },
+        );
+      });
+
       api.registerCommand("reverse-tools", {
         description:
           "管理逆向工具 MCP 注入: /reverse-tools [status | start <name> | stop <name> | reload [name]]",
@@ -269,7 +402,19 @@ export default function (pi: ExtensionAPI) {
       api.on("before_agent_start", async (event) => {
         if (!modeCtx.isActive()) return;
 
-        event.systemPromptOptions.sections["reverse-tools"] = toolManager.formatPromptSection();
+        event.systemPromptOptions.sections["reverse-tools"] = [
+          toolManager.formatPromptSection(),
+          "",
+          "Ghidra MCP 就绪约定：",
+          "- 返回 `[NOT_READY] ... (analyzing)` 时，立刻调用一次 `ghidra_wait_ready`，不要向用户询问是否继续，也不要自己空转轮询。",
+          "- `ghidra_wait_ready` 会阻塞到初步分析完成（或超时）再返回；返回后再调用 get_program_info / decompile。",
+          "- 若本回合已经结束，插件会自动发起下一回合，要求调用 `ghidra_wait_ready` 后继续。",
+          "- 工程目录持久化在 `.cyber-tools/ghidra/projects/<targetName>/`；同一样本再次启动通常可复用已分析结果。",
+          "按样本类型选择 MCP（都需先 `/reverse-tools start <name>`，默认不自动启动）：",
+          "- 原生二进制（ELF/PE/Mach-O）：ghidra、rizin 或 ida-pro。",
+          "- Android APK：apk 看 smali/manifest/资源；jadx 看 Java 反编译（启动后调用 load_apk，path 传 APK）。",
+          "- iOS IPA 或 .app：ipa。用 parse_ipa_tool 或 full_static_analysis，参数 path 传目标路径。",
+        ].join("\n");
 
         if (activeWorkspace) {
           const manifest = readManifest(activeWorkspace.workspaceDir);
@@ -295,6 +440,10 @@ export default function (pi: ExtensionAPI) {
       });
     },
     {
+      // Outside an existing cyber cwd, /reverse <path> will switchSession — defer boot animation
+      // until withSession on the fresh ctx. Inside a workspace, animate on the normal mode switch.
+      resolveSwitchOptions: (args, ctx) =>
+        args.trim() && !isCyberWorkspaceDir(ctx.cwd) ? { skipAnimation: true } : undefined,
       onCommand: async (args, ctx) => {
         const target = args.trim();
         syncWorkspace(ctx);
@@ -320,7 +469,11 @@ export default function (pi: ExtensionAPI) {
           });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
-          ctx.ui.notify(`登记逆向目标失败: ${message}`, "error");
+          try {
+            ctx.ui.notify(`登记逆向目标失败: ${message}`, "error");
+          } catch {
+            /* ignore stale ctx after successful switchSession */
+          }
         }
       },
     },
@@ -340,7 +493,7 @@ async function ensureWorkspaceAndAddTarget(
   if (workspace && workspace.workspaceDir === ctx.cwd) {
     const summary = addTargetToWorkspace(workspace, targetPath);
     onBound(workspace);
-    switchCyberMode(pi, ctx, "reverse", {
+    await switchCyberMode(pi, ctx, "reverse", {
       engagementName: basename(workspace.workspaceDir),
     });
     ctx.ui.notify(
@@ -357,6 +510,9 @@ async function ensureWorkspaceAndAddTarget(
   }
 
   const summary = addTargetToWorkspace(workspace, targetPath);
+  // Persist mode on disk so the replacement session_start restores it.
+  // Do not call switchCyberMode / pi.* inside withSession — old pi is stale.
+  updateManifestActiveMode(workspace.workspaceDir, "reverse");
   const migratedSessionFile = migrateSessionToWorkspace(ctx.sessionManager, workspace);
   const workspaceName = basename(workspace.workspaceDir);
   const workspaceDir = workspace.workspaceDir;
@@ -364,11 +520,11 @@ async function ensureWorkspaceAndAddTarget(
 
   const result = await ctx.switchSession(migratedSessionFile, {
     withSession: async (newCtx: ExtensionCommandContext) => {
-      onBound(boundWorkspace);
-      switchCyberMode(pi, newCtx, "reverse", {
-        engagementName: workspaceName,
-        silent: true,
-      });
+      try {
+        await playCyberEnterAnimation(newCtx, "reverse", workspaceName);
+      } catch {
+        /* animation must not fail the handoff */
+      }
       newCtx.ui.notify(
         createdNew
           ? `已创建 Cyber 工作区并登记逆向目标: ${summary.name}\n工作区: ${workspaceName} (${workspaceDir})`
@@ -381,7 +537,7 @@ async function ensureWorkspaceAndAddTarget(
   if (result.cancelled) {
     onBound(boundWorkspace);
     pi.appendEntry(CYBER_WORKSPACE_ENTRY_TYPE, boundWorkspace);
-    switchCyberMode(pi, ctx, "reverse", {
+    await switchCyberMode(pi, ctx, "reverse", {
       engagementName: workspaceName,
     });
     ctx.ui.notify("会话切换被取消，目标已登记但未切换会话", "warning");

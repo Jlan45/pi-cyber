@@ -3,8 +3,13 @@ import type {
   ExtensionCommandContext,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { applyCyberEditorStyle } from "./editor-style.ts";
+import { playCyberEnterAnimation } from "./enter-animation.ts";
 
 export type CyberModeId = "pentest" | "reverse" | "attribution" | "remediation";
+
+/** Tracks last broadcast mode so re-entry to the same mode skips the boot animation. */
+let lastBroadcastMode: CyberModeId | null = null;
 
 export interface CyberModeMeta {
   id: CyberModeId;
@@ -55,6 +60,11 @@ export interface ModeModuleContext {
 
 export interface ModeModuleOptions {
   onCommand?: (args: string, ctx: ExtensionCommandContext) => Promise<void> | void;
+  /** Optional per-invocation switch options (e.g. skip boot animation before a session migrate). */
+  resolveSwitchOptions?: (
+    args: string,
+    ctx: ExtensionCommandContext,
+  ) => SwitchCyberModeOptions | undefined;
 }
 
 /**
@@ -75,7 +85,7 @@ export function registerModeModule(
   pi.registerCommand(meta.command, {
     description: meta.description,
     handler: async (args, ctx) => {
-      switchCyberMode(pi, ctx, meta.id);
+      await switchCyberMode(pi, ctx, meta.id, options?.resolveSwitchOptions?.(args, ctx));
       await options?.onCommand?.(args, ctx);
     },
   });
@@ -88,20 +98,26 @@ export interface SwitchCyberModeOptions {
   engagementName?: string;
   /** Suppress the toast notification (useful during session restore). */
   silent?: boolean;
+  /** Skip the enter-mode boot overlay (e.g. tool auto-activate during agent turns). */
+  skipAnimation?: boolean;
 }
 
 /**
  * Broadcasts a working-mode change across loaded pi-cyber extensions and updates the footer status.
+ * When entering a different mode in TUI (and not silent), plays a short boot overlay.
  */
-export function switchCyberMode(
+export async function switchCyberMode(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   mode: CyberModeId | null,
   options?: SwitchCyberModeOptions,
-): void {
+): Promise<void> {
+  const modeChanged = mode !== lastBroadcastMode;
+  lastBroadcastMode = mode;
   pi.events.emit(CYBER_MODE_EVENT, mode);
 
   if (mode === null) {
+    applyCyberEditorStyle(ctx, false);
     ctx.ui.setStatus(CYBER_STATUS_KEY, undefined);
     if (!options?.silent) {
       ctx.ui.notify("已退出网络安全工作模式", "info");
@@ -112,6 +128,23 @@ export function switchCyberMode(
   const meta = CYBER_MODES[mode];
   const suffix = options?.engagementName ? ` (${options.engagementName})` : ` (${meta.id})`;
   ctx.ui.setStatus(CYBER_STATUS_KEY, `Cyber: ${meta.label}${suffix}`);
+  applyCyberEditorStyle(ctx, true);
+
+  const shouldAnimate =
+    modeChanged && !options?.silent && !options?.skipAnimation && ctx.mode === "tui";
+  if (shouldAnimate) {
+    try {
+      await playCyberEnterAnimation(ctx, mode, options?.engagementName);
+    } catch {
+      // Animation must never take down the session / mode switch.
+      try {
+        ctx.ui.setWidget("pi-cyber-enter", undefined);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
   if (!options?.silent) {
     ctx.ui.notify(`已切换至「${meta.label}」工作模式`, "info");
   }

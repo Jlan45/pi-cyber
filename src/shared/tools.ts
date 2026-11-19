@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { ExtensionAPI, McpServerConfig } from "@earendil-works/pi-coding-agent";
+import { getToolPathsFile, resolveToolPaths } from "./tool-paths.ts";
 
 export type CyberToolStatus = "stopped" | "starting" | "running" | "error";
 export type CyberToolAction = "status" | "start" | "stop" | "reload";
@@ -48,12 +49,14 @@ function buildTemplateVars(
   toolName: string,
   runtimeCtx: CyberToolRuntimeContext,
   toolDir: string,
+  configDir: string,
 ): Record<string, string> {
   return {
     cwd: runtimeCtx.cwd,
     workspaceDir: runtimeCtx.workspaceDir,
     sessionId: runtimeCtx.sessionId,
     toolDir,
+    configDir,
     targetPath: runtimeCtx.targetPath ?? "",
     targetName: runtimeCtx.targetName ?? "",
     toolName,
@@ -63,11 +66,21 @@ function buildTemplateVars(
 function expandTemplate(
   template: string,
   vars: Record<string, string>,
+  paths: Record<string, string>,
   toolName: string,
   requireTarget: boolean,
 ): string {
-  return template.replace(
-    /\$\{(cwd|workspaceDir|sessionId|toolDir|targetPath|targetName|toolName)\}/g,
+  const withPaths = template.replace(/\$\{path:([A-Za-z0-9_]+)\}/g, (_match, key: string) => {
+    const value = paths[key];
+    if (!value) {
+      throw new Error(
+        `工具 "${toolName}" 缺少路径 ${key}。请编辑 ${getToolPathsFile()}`,
+      );
+    }
+    return value;
+  });
+  return withPaths.replace(
+    /\$\{(cwd|workspaceDir|sessionId|toolDir|configDir|targetPath|targetName|toolName)\}/g,
     (_match, key: string) => {
       const val = vars[key];
       if (requireTarget && !val && (key === "targetPath" || key === "targetName")) {
@@ -243,6 +256,8 @@ export class CyberToolManager {
     string,
     { status: CyberToolStatus; toolDir?: string; resolvedCommand?: string; lastError?: string }
   >();
+  private reconcileTimer: ReturnType<typeof setTimeout> | undefined;
+  private reconcileGeneration = 0;
 
   constructor(
     pi: ExtensionAPI,
@@ -255,6 +270,87 @@ export class CyberToolManager {
     this.toolCommandName = options.toolCommandName ?? "cyber_tool";
     this.configHint = options.configHint ?? configPath;
     this.reloadConfigOnly();
+  }
+
+  /** True when Pi has registered live MCP tools for this server (connection succeeded). */
+  private hasLiveMcpTools(serverName: string): boolean {
+    const prefix = `mcp__${serverName}__`;
+    try {
+      return this.pi.getAllTools().some((tool) => tool.name.startsWith(prefix));
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Align local status with Pi's real MCP connection:
+   * registered + tools → running; registered + no tools → starting/error; else stopped.
+   */
+  reconcileStatuses(options?: { failIfStillStarting?: boolean }): void {
+    const registered = this.getRegisteredServerNames();
+    for (const cfg of this.configs) {
+      const prev = this.states.get(cfg.name) ?? { status: "stopped" as CyberToolStatus };
+      const isRegistered = registered.has(cfg.name);
+      if (!isRegistered) {
+        if (prev.status === "stopped" && !prev.lastError) continue;
+        // Keep explicit start() errors; clear transient starting/running when unregistered.
+        if (prev.status === "error" && prev.lastError) continue;
+        this.states.set(cfg.name, {
+          ...prev,
+          status: "stopped",
+          lastError: undefined,
+        });
+        continue;
+      }
+
+      if (this.hasLiveMcpTools(cfg.name)) {
+        this.states.set(cfg.name, {
+          ...prev,
+          status: "running",
+          lastError: undefined,
+        });
+        continue;
+      }
+
+      if (options?.failIfStillStarting && (prev.status === "starting" || prev.status === "running")) {
+        this.states.set(cfg.name, {
+          ...prev,
+          status: "error",
+          lastError: "MCP 连接失败或已断开（以 /mcp 为准）",
+        });
+        continue;
+      }
+
+      if (prev.status !== "error") {
+        this.states.set(cfg.name, {
+          ...prev,
+          status: "starting",
+          lastError: undefined,
+        });
+      }
+    }
+  }
+
+  /** Debounced multi-attempt reconcile after Pi finishes connecting registered servers. */
+  scheduleReconcile(onUpdate?: () => void): void {
+    const generation = ++this.reconcileGeneration;
+    if (this.reconcileTimer) clearTimeout(this.reconcileTimer);
+
+    const delays = [400, 1200, 3000, 6000];
+    let step = 0;
+
+    const tick = () => {
+      if (generation !== this.reconcileGeneration) return;
+      const isLast = step >= delays.length - 1;
+      this.reconcileStatuses({ failIfStillStarting: isLast });
+      onUpdate?.();
+      step += 1;
+      if (!isLast) {
+        this.reconcileTimer = setTimeout(tick, delays[step]! - delays[step - 1]!);
+      }
+    };
+
+    this.reconcileTimer = setTimeout(tick, delays[0]!);
   }
 
   reloadConfigOnly(): void {
@@ -283,7 +379,8 @@ export class CyberToolManager {
     const toolDir = join(runtimeCtx.workspaceDir, ".cyber-tools", entry.name);
     mkdirSync(toolDir, { recursive: true });
 
-    const vars = buildTemplateVars(entry.name, runtimeCtx, toolDir);
+    const vars = buildTemplateVars(entry.name, runtimeCtx, toolDir, dirname(this.configPath));
+    const paths = resolveToolPaths();
     const parsed = parseStartCommand(entry);
     const requireTarget =
       parsed.command.includes("${targetPath}") ||
@@ -293,19 +390,19 @@ export class CyberToolManager {
         (v) => v.includes("${targetPath}") || v.includes("${targetName}"),
       );
 
-    const command = expandTemplate(parsed.command, vars, entry.name, requireTarget);
-    const args = parsed.args.map((arg) => expandTemplate(arg, vars, entry.name, requireTarget));
+    const command = expandTemplate(parsed.command, vars, paths, entry.name, requireTarget);
+    const args = parsed.args.map((arg) => expandTemplate(arg, vars, paths, entry.name, requireTarget));
 
     let env: Record<string, string> | undefined;
     if (entry.env) {
       env = {};
       for (const [key, val] of Object.entries(entry.env)) {
-        env[key] = expandTemplate(val, vars, entry.name, requireTarget);
+        env[key] = expandTemplate(val, vars, paths, entry.name, requireTarget);
       }
     }
 
     const cwd = entry.cwd
-      ? expandTemplate(entry.cwd, vars, entry.name, requireTarget)
+      ? expandTemplate(entry.cwd, vars, paths, entry.name, requireTarget)
       : runtimeCtx.workspaceDir;
 
     return {
@@ -331,14 +428,16 @@ export class CyberToolManager {
       throw new Error(`未找到名为 "${name}" 的${this.label}工具配置`);
     }
 
-    this.states.set(name, { status: "starting" });
+    this.states.set(name, { status: "starting", lastError: undefined });
     try {
       const { mcpConfig, toolDir, resolvedCommand } = this.buildMcpConfig(entry, runtimeCtx);
       if (this.getRegisteredServerNames().has(name)) {
         this.pi.unregisterMcpServer(name);
       }
       this.pi.registerMcpServer(name, mcpConfig);
-      this.states.set(name, { status: "running", toolDir, resolvedCommand });
+      // Stay "starting" until Pi actually connects and exposes mcp__<name>__* tools.
+      this.states.set(name, { status: "starting", toolDir, resolvedCommand });
+      this.scheduleReconcile();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.states.set(name, { status: "error", lastError: message });
@@ -413,6 +512,8 @@ export class CyberToolManager {
   }
 
   getStatusList(name?: string): CyberToolStatusInfo[] {
+    // Cheap live sync before reporting (no fail-yet — use scheduleReconcile for that).
+    this.reconcileStatuses();
     const registered = this.getRegisteredServerNames();
     const list = name ? this.configs.filter((c) => c.name === name) : this.configs;
 
@@ -432,7 +533,7 @@ export class CyberToolManager {
         name: cfg.name,
         description: cfg.description,
         startCommand: displayCommand,
-        status: mcpRegistered && state.status === "stopped" ? "running" : state.status,
+        status: state.status,
         autoStart: Boolean(cfg.autoStart),
         mcpRegistered,
         toolDir: state.toolDir,

@@ -4,12 +4,13 @@ import {
   copyFileSync,
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, isAbsolute, join, parse, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
 import {
   type CustomEntry,
   type SessionEntry,
@@ -273,6 +274,64 @@ export function loadCyberWorkspaceFromDir(
     engagementName: manifest.name,
     createdAt: manifest.createdAt,
   };
+}
+
+export interface CyberProjectInfo {
+  workspaceDir: string;
+  name: string;
+  activeMode: CyberModeId | null;
+  createdAt: string;
+  mtimeMs: number;
+}
+
+/**
+ * Lists Cyber engagement projects under `rootCwd` (immediate children with `.cyber/manifest.json`).
+ * If `rootCwd` itself is a workspace, includes it and sibling workspaces under its parent.
+ */
+export function listCyberProjects(rootCwd: string): CyberProjectInfo[] {
+  const results: CyberProjectInfo[] = [];
+  const seen = new Set<string>();
+
+  const tryAdd = (dir: string) => {
+    const resolved = resolve(dir);
+    if (seen.has(resolved)) return;
+    const manifest = readManifest(resolved);
+    if (!manifest) return;
+    seen.add(resolved);
+    let mtimeMs = 0;
+    try {
+      mtimeMs = statSync(getManifestPath(resolved)).mtimeMs;
+    } catch {
+      // ignore
+    }
+    results.push({
+      workspaceDir: resolved,
+      name: manifest.name,
+      activeMode: manifest.activeMode,
+      createdAt: manifest.createdAt,
+      mtimeMs,
+    });
+  };
+
+  const scanChildren = (parent: string) => {
+    try {
+      for (const name of readdirSync(parent)) {
+        if (name.startsWith(".")) continue;
+        tryAdd(join(parent, name));
+      }
+    } catch {
+      // ignore unreadable dirs
+    }
+  };
+
+  if (isCyberWorkspaceDir(rootCwd)) {
+    tryAdd(rootCwd);
+    scanChildren(dirname(rootCwd));
+  } else {
+    scanChildren(rootCwd);
+  }
+
+  return results.sort((a, b) => b.mtimeMs - a.mtimeMs);
 }
 
 /**

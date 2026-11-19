@@ -17,22 +17,73 @@
     },
     {
       "name": "ghidra",
-      "description": "Ghidra 静态反编译、函数符号与交叉引用分析 MCP 服务",
-      "startCommand": "uvx ghidra-mcp",
+      "description": "Ghidra 静态反编译、函数符号与交叉引用分析 MCP 服务（headless，需已登记 targets）",
+      "startCommand": "${path:uvx} --python 3.12 --from git+https://github.com/LaurieWired/GhidraMCP[headless] ghidra-mcp --headless --binary ${targetPath} --project ${toolDir}/projects/${targetName} --ghidra-install-dir ${path:ghidraInstallDir} --extension-jar ${path:ghidraMcpJar} --ready-timeout 600",
+      "env": {
+        "GHIDRA_INSTALL_DIR": "${path:ghidraInstallDir}",
+        "JAVA_HOME": "${path:javaHome}",
+        "PATH": "${path:javaHome}/bin:${path:binDir}:/usr/bin:/bin",
+        "PI_CYBER_SESSION_ID": "${sessionId}",
+        "PI_CYBER_WORKSPACE": "${workspaceDir}"
+      },
       "autoStart": false,
       "mcp": {
         "exposure": "direct",
-        "timeout": 30000
+        "timeout": 600000
       }
     },
     {
-      "name": "radare2",
-      "description": "radare2 / r2pipe 二进制检查、反汇编与段信息分析 MCP 服务",
-      "startCommand": "npx -y r2mcp",
+      "name": "rizin",
+      "description": "Rizin (https://github.com/rizinorg/rizin) 二进制检查、反汇编与交叉引用 MCP",
+      "startCommand": "${path:rizinMcp} ${targetPath} --transport pipe --rizin ${path:rizinBin} --analysis basic",
       "autoStart": false,
       "mcp": {
         "exposure": "direct",
-        "timeout": 30000
+        "timeout": 120000
+      }
+    },
+    {
+      "name": "jadx",
+      "description": "Android APK/DEX/JAR Java 反编译 MCP（jadx-core，无 GUI；启动后用 load_apk 打开目标）",
+      "startCommand": "${path:javaBin} -jar ${path:jadxJar}",
+      "env": {
+        "JAVA_HOME": "${path:javaHome}",
+        "PI_CYBER_SESSION_ID": "${sessionId}",
+        "PI_CYBER_WORKSPACE": "${workspaceDir}"
+      },
+      "autoStart": false,
+      "mcp": {
+        "exposure": "direct",
+        "timeout": 300000
+      }
+    },
+    {
+      "name": "apk",
+      "description": "Android APK 静态分析 MCP（apktool：解码、manifest、smali、资源）",
+      "startCommand": "${path:uv} run --python 3.12 ${configDir}/vendor/apktool_mcp_server.py --workspace ${toolDir}/workspace",
+      "env": {
+        "APKTOOL_WORKSPACE": "${toolDir}/workspace",
+        "PI_CYBER_SESSION_ID": "${sessionId}",
+        "PI_CYBER_WORKSPACE": "${workspaceDir}"
+      },
+      "autoStart": false,
+      "mcp": {
+        "exposure": "direct",
+        "timeout": 300000
+      }
+    },
+    {
+      "name": "ipa",
+      "description": "iOS IPA / Mach-O 静态分析 MCP（解析包、entitlements、ObjC/Swift、加密检测）",
+      "startCommand": "${path:uvx} --python 3.12 --constraints ${configDir}/vendor/re-ios-constraints.txt --from git+https://github.com/gyh20062008-commits/re-ios re-ios",
+      "env": {
+        "PI_CYBER_SESSION_ID": "${sessionId}",
+        "PI_CYBER_WORKSPACE": "${workspaceDir}"
+      },
+      "autoStart": false,
+      "mcp": {
+        "exposure": "direct",
+        "timeout": 120000
       }
     }
   ]

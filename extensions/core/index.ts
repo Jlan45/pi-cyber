@@ -6,6 +6,10 @@ import {
   isToolCallEventType,
 } from "@earendil-works/pi-coding-agent";
 import {
+  showCyberModeSelector,
+  showCyberProjectSelector,
+} from "../../src/shared/cyber-selector.ts";
+import {
   CYBER_MODES,
   CYBER_MODE_EVENT,
   CYBER_STATUS_KEY,
@@ -19,8 +23,8 @@ import {
   CYBER_WORKSPACE_ENTRY_TYPE,
   createCyberWorkspace,
   formatWorkspacePromptSection,
-  formatWorkspaceSummary,
   isCyberWorkspaceDir,
+  listCyberProjects,
   loadCyberWorkspaceFromDir,
   migrateSessionToWorkspace,
   quoteShellPath,
@@ -63,12 +67,28 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
+  const safeSetStatus = (
+    mode: CyberModeId | null,
+    engagementName?: string,
+  ) => {
+    if (!lastCtx) return;
+    try {
+      if (mode) {
+        setCyberStatusLabel(lastCtx, mode, engagementName);
+      } else {
+        setCyberStatusLabel(lastCtx, null);
+      }
+    } catch {
+      // ctx may be stale across session replacement; drop it
+      lastCtx = null;
+    }
+  };
+
   pi.events.on(CYBER_WORKSPACE_EVENT, (data) => {
     const workspace = data as CyberWorkspaceState | null;
     activeWorkspace = workspace;
-    if (lastCtx && activeMode) {
-      setCyberStatusLabel(
-        lastCtx,
+    if (activeMode) {
+      safeSetStatus(
         activeMode,
         workspace ? basename(workspace.workspaceDir) : undefined,
       );
@@ -80,13 +100,10 @@ export default function (pi: ExtensionAPI) {
     activeMode = nextMode;
     if (activeWorkspace) {
       updateManifestActiveMode(activeWorkspace.workspaceDir, nextMode);
-      if (lastCtx) {
-        setCyberStatusLabel(
-          lastCtx,
-          nextMode,
-          nextMode ? basename(activeWorkspace.workspaceDir) : undefined,
-        );
-      }
+      safeSetStatus(
+        nextMode,
+        nextMode ? basename(activeWorkspace.workspaceDir) : undefined,
+      );
     }
   });
 
@@ -96,7 +113,7 @@ export default function (pi: ExtensionAPI) {
     if (activeWorkspace && activeWorkspace.workspaceDir === ctx.cwd) {
       const manifest = readManifest(activeWorkspace.workspaceDir);
       if (manifest?.activeMode && isCyberModeId(manifest.activeMode)) {
-        switchCyberMode(pi, ctx, manifest.activeMode, {
+        await switchCyberMode(pi, ctx, manifest.activeMode, {
           engagementName: basename(activeWorkspace.workspaceDir),
           silent: true,
         });
@@ -142,7 +159,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("cyber", {
     description:
-      "Cyber 工作区总控: /cyber [name | pentest|reverse|attribution|remediation | off]",
+      "Cyber 工作区总控: /cyber 选择项目→模式；或 [name | pentest|… | off]",
     handler: async (args, ctx) => {
       lastCtx = ctx;
       const raw = args.trim();
@@ -152,7 +169,7 @@ export default function (pi: ExtensionAPI) {
         if (activeWorkspace) {
           updateManifestActiveMode(activeWorkspace.workspaceDir, null);
         }
-        switchCyberMode(pi, ctx, null);
+        await switchCyberMode(pi, ctx, null);
         return;
       }
 
@@ -164,71 +181,21 @@ export default function (pi: ExtensionAPI) {
           }
         }
         if (!activeWorkspace) {
-          ctx.ui.notify(
-            "尚未绑定 Cyber 工作区。请先使用 `/cyber <任务名>` 创建，或在工作区内打开会话。",
-            "warning",
-          );
+          ctx.ui.notify("尚未绑定 Cyber 工作区。请先 `/cyber` 选择或新建项目。", "warning");
           return;
         }
-        switchCyberMode(pi, ctx, target, {
+        await switchCyberMode(pi, ctx, target, {
           engagementName: basename(activeWorkspace.workspaceDir),
         });
         return;
       }
 
       if (!raw) {
-        if (activeWorkspace) {
-          const manifest = readManifest(activeWorkspace.workspaceDir);
-          const modeLabel = manifest?.activeMode
-            ? CYBER_MODES[manifest.activeMode].label
-            : "未设置";
-          ctx.ui.notify(
-            [
-              `当前 Cyber 工作区: ${activeWorkspace.workspaceDir}`,
-              `任务: ${activeWorkspace.engagementName}`,
-              `模式: ${modeLabel}`,
-              "可用: /cyber <任务名> | /cyber pentest|reverse|attribution|remediation | /cyber off",
-            ].join("\n"),
-            "info",
-          );
-          return;
-        }
-
-        if (isCyberWorkspaceDir(ctx.cwd)) {
-          const ws = loadCyberWorkspaceFromDir(ctx.cwd);
-          if (ws) {
-            bindWorkspace(ctx, ws, true);
-            ctx.ui.notify(formatWorkspaceSummary(ws), "info");
-            return;
-          }
-        }
-
-        const choices = [
-          ...Object.values(CYBER_MODES).map((mode) => `${mode.id} — ${mode.description}`),
-          "create — 创建新的 Cyber 工作区",
-          "off — 退出当前工作模式",
-        ];
-        const selected = await ctx.ui.select("Cyber 工作区 / 模式", choices);
-        if (!selected) return;
-
-        const selectedId = selected.split(" — ")[0];
-        if (selectedId === "off") {
-          switchCyberMode(pi, ctx, null);
-          return;
-        }
-        if (selectedId === "create") {
-          const name = await ctx.ui.input("输入任务/工作区名称");
-          if (!name?.trim()) return;
-          await createAndMigrate(pi, ctx, name.trim(), bindWorkspace);
-          return;
-        }
-        if (isCyberModeId(selectedId)) {
-          ctx.ui.notify(
-            "请先 `/cyber <任务名>` 创建工作区，再切换模式；或在已有工作区目录中打开会话。",
-            "warning",
-          );
-          return;
-        }
+        await openCyberWizard(pi, ctx, {
+          activeWorkspace,
+          activeMode,
+          bindWorkspace,
+        });
         return;
       }
 
@@ -237,10 +204,131 @@ export default function (pi: ExtensionAPI) {
         await createAndMigrate(pi, ctx, raw, bindWorkspace);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        ctx.ui.notify(`创建 Cyber 工作区失败: ${message}`, "error");
+        try {
+          ctx.ui.notify(`创建 Cyber 工作区失败: ${message}`, "error");
+        } catch {
+          /* ignore stale ctx */
+        }
       }
     },
   });
+}
+
+async function openCyberWizard(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  state: {
+    activeWorkspace: CyberWorkspaceState | null;
+    activeMode: CyberModeId | null;
+    bindWorkspace: (
+      ctx: ExtensionContext,
+      workspace: CyberWorkspaceState,
+      persist: boolean,
+    ) => void;
+  },
+): Promise<void> {
+  const scanRoot = state.activeWorkspace?.rootCwd ?? ctx.cwd;
+  const projects = listCyberProjects(scanRoot);
+
+  const projectChoice = await showCyberProjectSelector(ctx, projects, {
+    currentWorkspaceDir: state.activeWorkspace?.workspaceDir ?? null,
+    modeActive: state.activeMode !== null,
+  });
+
+  if (projectChoice.action === "cancel") return;
+
+  if (projectChoice.action === "off") {
+    if (state.activeWorkspace) {
+      updateManifestActiveMode(state.activeWorkspace.workspaceDir, null);
+    }
+    await switchCyberMode(pi, ctx, null);
+    return;
+  }
+
+  if (projectChoice.action === "create") {
+    const name = (await ctx.ui.input("新建项目名称", "engagement"))?.trim();
+    if (!name) return;
+    const modeChoice = await showCyberModeSelector(ctx, {
+      projectLabel: name,
+      currentMode: null,
+    });
+    if (modeChoice.action === "cancel") return;
+    try {
+      await createAndMigrate(pi, ctx, name, state.bindWorkspace, modeChoice.mode);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      try {
+        ctx.ui.notify(`创建 Cyber 工作区失败: ${message}`, "error");
+      } catch {
+        /* ignore stale ctx */
+      }
+    }
+    return;
+  }
+
+  const ws =
+    loadCyberWorkspaceFromDir(projectChoice.workspaceDir, scanRoot) ??
+    loadCyberWorkspaceFromDir(projectChoice.workspaceDir);
+  if (!ws) {
+    ctx.ui.notify(`无法加载项目: ${projectChoice.workspaceDir}`, "error");
+    return;
+  }
+  const manifest = readManifest(ws.workspaceDir);
+  const modeChoice = await showCyberModeSelector(ctx, {
+    projectLabel: basename(ws.workspaceDir),
+    currentMode: manifest?.activeMode ?? null,
+  });
+  if (modeChoice.action === "cancel") return;
+
+  try {
+    await openExistingProject(pi, ctx, ws, modeChoice.mode, state.bindWorkspace);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    try {
+      ctx.ui.notify(`打开 Cyber 项目失败: ${message}`, "error");
+    } catch {
+      /* ignore stale ctx */
+    }
+  }
+}
+
+async function openExistingProject(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  workspace: CyberWorkspaceState,
+  mode: CyberModeId,
+  bindWorkspace: (
+    ctx: ExtensionContext,
+    workspace: CyberWorkspaceState,
+    persist: boolean,
+  ) => void,
+): Promise<void> {
+  updateManifestActiveMode(workspace.workspaceDir, mode);
+  const workspaceName = basename(workspace.workspaceDir);
+
+  if (ctx.cwd === workspace.workspaceDir) {
+    bindWorkspace(ctx, workspace, true);
+    await switchCyberMode(pi, ctx, mode, { engagementName: workspaceName });
+    return;
+  }
+
+  // Prefer writing activeMode before switchSession; the replacement instance
+  // restores mode from manifest in session_start (old `pi` is stale after switch).
+  const migratedSessionFile = migrateSessionToWorkspace(ctx.sessionManager, workspace);
+  const result = await ctx.switchSession(migratedSessionFile, {
+    withSession: async (newCtx: ExtensionCommandContext) => {
+      newCtx.ui.notify(
+        `已切换至 Cyber 项目: ${workspaceName} · ${CYBER_MODES[mode].label}`,
+        "info",
+      );
+    },
+  });
+
+  if (result.cancelled) {
+    bindWorkspace(ctx, workspace, true);
+    await switchCyberMode(pi, ctx, mode, { engagementName: workspaceName });
+    ctx.ui.notify("会话切换被取消，已在当前会话绑定该项目", "warning");
+  }
 }
 
 async function createAndMigrate(
@@ -252,26 +340,32 @@ async function createAndMigrate(
     workspace: CyberWorkspaceState,
     persist: boolean,
   ) => void,
+  mode?: CyberModeId,
 ): Promise<void> {
   const workspace = createCyberWorkspace(ctx.cwd, engagementName);
+  if (mode) {
+    updateManifestActiveMode(workspace.workspaceDir, mode);
+  }
   const migratedSessionFile = migrateSessionToWorkspace(ctx.sessionManager, workspace);
   const workspaceName = basename(workspace.workspaceDir);
   const workspaceDir = workspace.workspaceDir;
 
   const result = await ctx.switchSession(migratedSessionFile, {
     withSession: async (newCtx: ExtensionCommandContext) => {
-      bindWorkspace(newCtx, workspace, false);
-      // Session file already contains the workspace entry from migrateSessionToWorkspace
       newCtx.ui.notify(
-        `已创建并迁移会话至 Cyber 工作区: ${workspaceName} (${workspaceDir})`,
+        mode
+          ? `已创建并进入: ${workspaceName} · ${CYBER_MODES[mode].label} (${workspaceDir})`
+          : `已创建并迁移会话至 Cyber 工作区: ${workspaceName} (${workspaceDir})`,
         "info",
       );
     },
   });
 
   if (result.cancelled) {
-    // Still bind in current session so tools can use the created dir if desired
     bindWorkspace(ctx, workspace, true);
+    if (mode) {
+      await switchCyberMode(pi, ctx, mode, { engagementName: workspaceName });
+    }
     ctx.ui.notify("会话切换被取消，Cyber 工作区已创建但未切换会话", "warning");
   }
 }

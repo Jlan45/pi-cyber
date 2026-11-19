@@ -43,25 +43,31 @@ pi-cyber/
 
 | 命令 | 作用 |
 |------|------|
-| `/cyber <任务名>` | 创建工作区并迁移会话 |
-| `/cyber` | 查看当前工作区状态，或交互选择 |
+| `/cyber` | 两级选择器：先选项目，再选模式（可新建） |
+| `/cyber <任务名>` | 直接创建工作区并迁移会话 |
 | `/cyber pentest\|reverse\|...` | 在当前工作区内切换模式 |
 | `/cyber off` | 退出工作模式（保留目录） |
 | `/pentest` / `/reverse` / … | 切换模式；逆向可用 `/reverse <路径>` 自动建区并登记目标 |
-| `/pentest-tools` / `/reverse-tools` | 管理各模式 MCP 工具（status/start/stop/reload） |
+| `/runtime` | 打开与 model 同风格的执行环境选择器（全局默认 + 工作区覆盖）；渗透模式下劫持 bash / `!` |
+| `/reverse-tools` | 管理逆向 MCP（IDA / Ghidra 等）；渗透侧扫描改走远程 runtime 的 bash |
 
 ## 渗透模式要点
 
 1. `/cyber <任务名>` 创建工作区  
-2. `pentest_set_scope` 写入授权范围（`in_scope` / `out_of_scope`）  
-3. 信息收集与安全评估；bash 中出现的主机若越界会被护栏拦截  
-4. 证据与报告写入 `notes/` `evidence/` `reports/` `pentest/`
+2. 配置执行环境（列表，含 `name` / `type`；ssh 含认证）：  
+   - 全局默认：`~/.pi/agent/pi-cyber/execution.json`（`/runtime ssh lab root@host --global`）  
+   - 工作区覆盖：`.cyber/execution.json`（同名覆盖 + `active`）  
+   - 切换：`/runtime` 选择器，或 `/runtime use <name>` / `local`
+3. `pentest_set_scope` 写入授权范围（`in_scope` / `out_of_scope`）  
+4. 信息收集与安全评估（httpx/nuclei 等在远程 runtime 上执行，不再加载本机 MCP）；主机越界会被护栏拦截  
+5. 证据与报告写入 `notes/` `evidence/` `reports/` `pentest/`
 
 ## 逆向模式要点
 
 1. 已有工作区：`/reverse <二进制>` 或 `reverse_add_target` 将样本拷入 `targets/`  
 2. 无工作区：`/reverse <路径>` 按目标名创建 Cyber 工作区、登记目标并迁移会话  
-3. `/reverse-tools` 启动 IDA / Ghidra / radare2 等 MCP（见 `extensions/reverse/tools.json`）
+3. `/reverse-tools` 按类型启动 MCP：原生用 IDA / Ghidra / Rizin，APK 用 `apk`（smali）和 `jadx`（Java），IPA 用 `ipa`
+4. 工具路径不写死在仓库里。首次启动会在 `~/.pi/agent/pi-cyber/tool-paths.json` 写入探测结果，改这个文件即可换 Ghidra、Java、Rizin、jadx jar 等位置
 
 ## 本地调试
 
