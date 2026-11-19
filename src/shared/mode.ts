@@ -8,8 +8,23 @@ import { playCyberEnterAnimation } from "./enter-animation.ts";
 
 export type CyberModeId = "pentest" | "reverse" | "attribution" | "remediation";
 
-/** Tracks last broadcast mode so re-entry to the same mode skips the boot animation. */
-let lastBroadcastMode: CyberModeId | null = null;
+/**
+ * Pi loads each extension as its own module instance, so a file-level variable
+ * is not shared. The footer is updated by whichever copy ran switchCyberMode,
+ * while /runtime and /reverse-tools read another copy and think the mode is off.
+ */
+const CYBER_MODE_STATE_KEY = "__piCyberActiveMode";
+
+function readBroadcastMode(): CyberModeId | null {
+  const value = (globalThis as Record<string, unknown>)[CYBER_MODE_STATE_KEY];
+  return value === "pentest" || value === "reverse" || value === "attribution" || value === "remediation"
+    ? value
+    : null;
+}
+
+function writeBroadcastMode(mode: CyberModeId | null): void {
+  (globalThis as Record<string, unknown>)[CYBER_MODE_STATE_KEY] = mode;
+}
 
 /** Slash commands that stay hidden until a working mode is active. `/cyber` is the only entry. */
 export const CYBER_ONLY_COMMANDS = [
@@ -35,7 +50,7 @@ export const CYBER_ONLY_TOOLS = [
 ] as const;
 
 export function isCyberModeActive(): boolean {
-  return lastBroadcastMode !== null;
+  return readBroadcastMode() !== null;
 }
 
 export function refuseOutsideCyberMode(ctx: { ui: { notify: (message: string, type?: "info" | "warning" | "error") => void } }): boolean {
@@ -157,8 +172,8 @@ export async function switchCyberMode(
   mode: CyberModeId | null,
   options?: SwitchCyberModeOptions,
 ): Promise<void> {
-  const modeChanged = mode !== lastBroadcastMode;
-  lastBroadcastMode = mode;
+  const modeChanged = mode !== readBroadcastMode();
+  writeBroadcastMode(mode);
   pi.events.emit(CYBER_MODE_EVENT, mode);
 
   if (mode === null) {
