@@ -64,9 +64,9 @@ pi-cyber/
    - 工作区覆盖：`.cyber/execution.json`（同名覆盖 + `active`）  
    - 切换：`/runtime` 选择器，或 `/runtime use <name>` / `local`
 3. `pentest_set_scope` 写入授权范围（`in_scope` / `out_of_scope`）  
-4. 信息收集与安全评估（httpx/nuclei 等在远程 runtime 上执行，不再加载本机 MCP）  
-5. 远程命令写出的文件在远端磁盘上。用 `pentest_fetch` 通过 SFTP 拉回 `evidence/` 再读  
-6. 证据与报告写入 `notes/` `evidence/` `reports/` `pentest/`
+4. 信息收集与安全评估（远程 SSH runtime 激活时，`bash`、`read`、`write`、`edit`、`ls`、`find`、`grep` 与 `!` / `!!` 全部直接在远端执行；不再注入本机 MCP）  
+5. 如需将远端文件拉回本机 `evidence/` 留档，可用 `pentest_fetch` 通过 SFTP 拉回  
+6. 证据与报告写入工作区（本机或远端）
 
 授权范围（`scope.json`）：
 - `pentest_set_scope` 写入 `in_scope` / `out_of_scope` 并注入系统提示词，由模型自行判断边界；框架侧不对 `bash` / `!` 做拦截或确认

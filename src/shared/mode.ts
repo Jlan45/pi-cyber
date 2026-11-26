@@ -33,14 +33,12 @@ export const CYBER_ONLY_COMMANDS = [
   "attribution",
   "remediation",
   "runtime",
-  "pentest-tools",
   "reverse-tools",
 ] as const;
 
 /** Commands that only make sense inside one specific mode. Others (mode switches) work in any mode. */
 export const CYBER_MODE_COMMANDS: Partial<Record<string, CyberModeId>> = {
   runtime: "pentest",
-  "pentest-tools": "pentest",
   "reverse-tools": "reverse",
 };
 
@@ -50,7 +48,6 @@ export const CYBER_TOOLS_BY_MODE: Record<CyberModeId, readonly string[]> = {
     "pentest_set_scope",
     "pentest_check_scope",
     "pentest_add_target",
-    "pentest_tool",
     "pentest_set_execution",
     "pentest_fetch",
   ],

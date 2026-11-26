@@ -221,12 +221,11 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_call", async (event, ctx) => {
     if (!activeMode || !activeWorkspace) return;
+    if (isRemoteExecutionActive()) return;
     if (activeWorkspace.workspaceDir === ctx.cwd) return;
 
     if (isToolCallEventType("bash", event)) {
-      if (!isRemoteExecutionActive()) {
-        event.input.command = `cd ${quoteShellPath(activeWorkspace.workspaceDir)} && ${event.input.command}`;
-      }
+      event.input.command = `cd ${quoteShellPath(activeWorkspace.workspaceDir)} && ${event.input.command}`;
       return;
     }
 

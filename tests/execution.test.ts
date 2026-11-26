@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  expandRemoteTilde,
+  globToRegExp,
   normalizeExecutionFile,
   quoteRemotePath,
   readExecutionFile,
@@ -52,4 +54,19 @@ test("hostKeyCheck is kept only for valid values", () => {
 test("the local cd added by the core redirect is stripped for remote runs", () => {
   assert.equal(stripLeadingLocalCd("cd '/w/ws' && nmap x", ["/w/ws"]), "nmap x");
   assert.equal(stripLeadingLocalCd("cd /other && nmap x", ["/w/ws"]), "cd /other && nmap x");
+});
+
+test("remote tilde expansion and glob matching", () => {
+  assert.equal(expandRemoteTilde("~", "/home/kali"), "/home/kali");
+  assert.equal(expandRemoteTilde("~/scans/out.txt", "/home/kali"), "/home/kali/scans/out.txt");
+  assert.equal(expandRemoteTilde("/etc/hosts", "/home/kali"), "/etc/hosts");
+
+  const re = globToRegExp("*.nmap");
+  assert.equal(re.test("scan.nmap"), true);
+  assert.equal(re.test("scan.txt"), false);
+
+  const deep = globToRegExp("evidence/**/*.json");
+  assert.equal(deep.test("evidence/a/b.json"), true);
+  assert.equal(deep.test("evidence/b.json"), true);
+  assert.equal(deep.test("other/b.json"), false);
 });

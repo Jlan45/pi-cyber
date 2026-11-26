@@ -1,8 +1,16 @@
 import { createHash, createHmac } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, posix, resolve } from "node:path";
-import { getAgentDir, type BashOperations } from "@earendil-works/pi-coding-agent";
+import { dirname, extname, join, posix, resolve } from "node:path";
+import {
+  getAgentDir,
+  type BashOperations,
+  type EditOperations,
+  type FindOperations,
+  type LsOperations,
+  type ReadOperations,
+  type WriteOperations,
+} from "@earendil-works/pi-coding-agent";
 import { Client, type ConnectConfig } from "ssh2";
 import { normalizeInputPath, quoteShellPath } from "./workspace.ts";
 
@@ -344,10 +352,9 @@ export function formatExecutionPromptSection(resolved: ResolvedExecution): strin
     const cwd = resolved.env.remoteCwd ? `，远程工作目录 ${resolved.env.remoteCwd}` : "";
     lines.push(
       "【强制】当前 Runtime = 远程 SSH，不是本机。",
-      `所有 bash 工具调用与用户 \`!\` / \`!!\` 命令一律在远程主机 ${host}${port} 上执行${cwd}（来源: ${resolved.source}，环境名: ${resolved.env.name}）。`,
-      "禁止假设命令在本机运行；本机路径、本机 localhost、本机进程与本机网络均不适用。",
-      "read / write / edit / MCP 仍在本机；只有 shell 命令通道走远程。",
-      "远程命令写出的文件（nmap -oA、截图、抓包等）在远端磁盘上，本机 read 看不到。需要留证时调用 `pentest_fetch` 把远端文件或目录拉回本机 evidence/，再 read。",
+      `所有 bash、read、write、edit、ls、find、grep 工具与用户 \`!\` / \`!!\` 命令一律直接在远程主机 ${host}${port} 上执行${cwd}（来源: ${resolved.source}，环境名: ${resolved.env.name}）。`,
+      "禁止假设命令或文件读写在本机运行；本机路径、本机 localhost、本机进程与本机网络均不适用。",
+      "渗透模式不注入本机 MCP；如需将远端产物拉回本机工作区 evidence/ 留档，可调用 `pentest_fetch`。",
       "远程连接经 ssh2 复用，空闲约 5 分钟断开。",
     );
   } else {
@@ -547,6 +554,7 @@ interface PooledSshClient {
   /** Commands / transfers currently using this connection. It is never idle-closed while busy. */
   active: number;
   idleTimer?: ReturnType<typeof setTimeout>;
+  remoteHome?: string;
 }
 
 const sshPool = new Map<string, PooledSshClient>();
@@ -939,4 +947,339 @@ export function setActiveEnvironment(
     throw new Error(`未知执行环境: ${name}`);
   }
   return normalizeExecutionFile({ ...file, active: name });
+}
+
+// ---------------------------------------------------------------------------
+// Remote filesystem operations (SFTP + SSH)
+// ---------------------------------------------------------------------------
+
+export interface RemoteBaseInfo {
+  home: string;
+  cwd: string;
+}
+
+async function withSftp<T>(
+  env: SshExecutionEnv,
+  localCwd: string,
+  fn: (sftp: import("ssh2").SFTPWrapper, entry: PooledSshClient) => Promise<T>,
+): Promise<T> {
+  const entry = await acquireSshEntry(env, localCwd);
+  entry.active += 1;
+  clearIdleTimer(entry);
+  try {
+    const sftp = await sftpCall<import("ssh2").SFTPWrapper>((done) => entry.client.sftp(done));
+    try {
+      return await fn(sftp, entry);
+    } finally {
+      try {
+        sftp.end();
+      } catch {
+        // ignore
+      }
+    }
+  } finally {
+    entry.active -= 1;
+    if (entry.active === 0 && sshPool.get(entry.key) === entry) scheduleIdleClose(entry);
+  }
+}
+
+export function expandRemoteTilde(rawPath: string, remoteHome: string): string {
+  const trimmed = rawPath.trim();
+  if (trimmed === "~") return remoteHome;
+  if (trimmed.startsWith("~/")) return posix.join(remoteHome, trimmed.slice(2));
+  return trimmed;
+}
+
+/** Resolves remote `$HOME` and effective `remoteCwd` over SFTP (cached per connection). */
+export async function getRemoteBaseInfo(
+  env: SshExecutionEnv,
+  localCwd: string = process.cwd(),
+): Promise<RemoteBaseInfo> {
+  return withSftp(env, localCwd, async (sftp, entry) => {
+    if (!entry.remoteHome) {
+      entry.remoteHome = await sftpCall<string>((done) => sftp.realpath(".", done));
+    }
+    const home = entry.remoteHome;
+    if (!env.remoteCwd) return { home, cwd: home };
+    const expanded = expandRemoteTilde(env.remoteCwd, home);
+    const cwd = posix.isAbsolute(expanded) ? posix.normalize(expanded) : posix.join(home, expanded);
+    return { home, cwd };
+  });
+}
+
+function readSftpFileBuffer(sftp: import("ssh2").SFTPWrapper, remotePath: string): Promise<Buffer> {
+  return new Promise((resolvePromise, reject) => {
+    const chunks: Buffer[] = [];
+    const stream = sftp.createReadStream(remotePath);
+    stream.on("data", (chunk: Buffer | string) => {
+      chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+    });
+    stream.on("error", (err: Error) => reject(err));
+    stream.on("end", () => resolvePromise(Buffer.concat(chunks)));
+  });
+}
+
+function writeSftpFile(
+  sftp: import("ssh2").SFTPWrapper,
+  remotePath: string,
+  content: string,
+): Promise<void> {
+  return new Promise((resolvePromise, reject) => {
+    const stream = sftp.createWriteStream(remotePath);
+    stream.on("error", (err: Error) => reject(err));
+    stream.on("close", () => resolvePromise());
+    stream.end(content, "utf8");
+  });
+}
+
+async function mkdirSftpRecursive(
+  sftp: import("ssh2").SFTPWrapper,
+  dirPath: string,
+): Promise<void> {
+  const normalized = posix.normalize(dirPath);
+  if (!normalized || normalized === "/" || normalized === ".") return;
+  const parts = normalized.split("/").filter(Boolean);
+  let current = normalized.startsWith("/") ? "/" : "";
+  for (const part of parts) {
+    current = current === "/" ? `/${part}` : current ? `${current}/${part}` : part;
+    try {
+      await sftpCall<import("ssh2").Stats>((done) => sftp.stat(current, done));
+    } catch {
+      try {
+        await sftpCall<void>((done) => sftp.mkdir(current, (err) => done(err)));
+      } catch (err) {
+        // Ignore race if directory was created concurrently
+        try {
+          const stats = await sftpCall<import("ssh2").Stats>((done) => sftp.stat(current, done));
+          if (stats.isDirectory()) continue;
+        } catch {
+          // rethrow original mkdir error
+        }
+        throw err;
+      }
+    }
+  }
+}
+
+const IMAGE_MIME_BY_EXT: Record<string, string> = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+};
+
+export function createSshReadOperations(
+  env: SshExecutionEnv,
+  localCwd: string = process.cwd(),
+): ReadOperations {
+  return {
+    access: (absolutePath) =>
+      withSftp(env, localCwd, async (sftp) => {
+        await sftpCall<import("ssh2").Stats>((done) => sftp.stat(absolutePath, done));
+      }),
+    readFile: (absolutePath) =>
+      withSftp(env, localCwd, (sftp) => readSftpFileBuffer(sftp, absolutePath)),
+    detectImageMimeType: async (absolutePath) =>
+      IMAGE_MIME_BY_EXT[extname(absolutePath).toLowerCase()] ?? null,
+  };
+}
+
+export function createSshWriteOperations(
+  env: SshExecutionEnv,
+  localCwd: string = process.cwd(),
+): WriteOperations {
+  return {
+    mkdir: (dir) => withSftp(env, localCwd, (sftp) => mkdirSftpRecursive(sftp, dir)),
+    writeFile: (absolutePath, content) =>
+      withSftp(env, localCwd, async (sftp) => {
+        await mkdirSftpRecursive(sftp, posix.dirname(absolutePath));
+        await writeSftpFile(sftp, absolutePath, content);
+      }),
+  };
+}
+
+export function createSshEditOperations(
+  env: SshExecutionEnv,
+  localCwd: string = process.cwd(),
+): EditOperations {
+  return {
+    access: (absolutePath) =>
+      withSftp(env, localCwd, async (sftp) => {
+        await sftpCall<import("ssh2").Stats>((done) => sftp.stat(absolutePath, done));
+      }),
+    readFile: (absolutePath) =>
+      withSftp(env, localCwd, (sftp) => readSftpFileBuffer(sftp, absolutePath)),
+    writeFile: (absolutePath, content) =>
+      withSftp(env, localCwd, (sftp) => writeSftpFile(sftp, absolutePath, content)),
+  };
+}
+
+export function createSshLsOperations(
+  env: SshExecutionEnv,
+  localCwd: string = process.cwd(),
+): LsOperations {
+  return {
+    exists: (absolutePath) =>
+      withSftp(env, localCwd, async (sftp) => {
+        try {
+          await sftpCall<import("ssh2").Stats>((done) => sftp.stat(absolutePath, done));
+          return true;
+        } catch {
+          return false;
+        }
+      }),
+    stat: (absolutePath) =>
+      withSftp(env, localCwd, async (sftp) => {
+        const stats = await sftpCall<import("ssh2").Stats>((done) => sftp.stat(absolutePath, done));
+        return { isDirectory: () => stats.isDirectory() };
+      }),
+    readdir: (absolutePath) =>
+      withSftp(env, localCwd, async (sftp) => {
+        const entries = await sftpCall<import("ssh2").FileEntryWithStats[]>((done) =>
+          sftp.readdir(absolutePath, done),
+        );
+        return entries
+          .map((e) => e.filename)
+          .filter((name) => name !== "." && name !== "..");
+      }),
+  };
+}
+
+export function globToRegExp(pattern: string): RegExp {
+  let regex = "^";
+  let i = 0;
+  while (i < pattern.length) {
+    const ch = pattern[i]!;
+    if (ch === "*") {
+      if (pattern[i + 1] === "*") {
+        if (pattern[i + 2] === "/") {
+          regex += "(?:.*/)?";
+          i += 3;
+          continue;
+        }
+        regex += ".*";
+        i += 2;
+        continue;
+      }
+      regex += "[^/]*";
+    } else if (ch === "?") {
+      regex += "[^/]";
+    } else if (".+^${}()|[]\\".includes(ch)) {
+      regex += `\\${ch}`;
+    } else {
+      regex += ch;
+    }
+    i += 1;
+  }
+  regex += "$";
+  return new RegExp(regex);
+}
+
+export function createSshFindOperations(
+  env: SshExecutionEnv,
+  localCwd: string = process.cwd(),
+): FindOperations {
+  return {
+    exists: (absolutePath) =>
+      withSftp(env, localCwd, async (sftp) => {
+        try {
+          await sftpCall<import("ssh2").Stats>((done) => sftp.stat(absolutePath, done));
+          return true;
+        } catch {
+          return false;
+        }
+      }),
+    glob: (pattern, cwd, options) =>
+      withSftp(env, localCwd, async (sftp) => {
+        const normalizedPattern = pattern.replace(/^\.\//, "");
+        const hasSlash = normalizedPattern.includes("/");
+        const matcher = globToRegExp(normalizedPattern);
+        const ignored = new Set([".git", "node_modules", ...options.ignore.map((x) => x.replace(/\/+$/, ""))]);
+        const results: string[] = [];
+
+        const walk = async (dir: string, relDir: string): Promise<void> => {
+          if (results.length >= options.limit) return;
+          let entries: import("ssh2").FileEntryWithStats[];
+          try {
+            entries = await sftpCall<import("ssh2").FileEntryWithStats[]>((done) =>
+              sftp.readdir(dir, done),
+            );
+          } catch {
+            return;
+          }
+          for (const entry of entries) {
+            if (results.length >= options.limit) break;
+            const name = entry.filename;
+            if (!name || name === "." || name === ".." || ignored.has(name)) continue;
+            const rel = relDir ? `${relDir}/${name}` : name;
+            const full = posix.join(dir, name);
+            if (entry.attrs.isDirectory()) {
+              if (matcher.test(hasSlash ? rel : name)) results.push(rel);
+              await walk(full, rel);
+            } else if (matcher.test(hasSlash ? rel : name)) {
+              results.push(rel);
+            }
+          }
+        };
+
+        await walk(cwd, "");
+        return results;
+      }),
+  };
+}
+
+export async function executeRemoteGrep(
+  env: SshExecutionEnv,
+  params: {
+    pattern: string;
+    path?: string;
+    glob?: string;
+    ignoreCase?: boolean;
+    literal?: boolean;
+    context?: number;
+    limit?: number;
+  },
+  options?: { localCwd?: string; signal?: AbortSignal },
+): Promise<{ output: string; exitCode: number | null }> {
+  const localCwd = options?.localCwd ?? process.cwd();
+  const base = await getRemoteBaseInfo(env, localCwd);
+  const rawTarget = params.path ? expandRemoteTilde(params.path, base.home) : base.cwd;
+  const target = posix.isAbsolute(rawTarget)
+    ? posix.normalize(rawTarget)
+    : posix.resolve(base.cwd, rawTarget);
+
+  const limit = Math.max(1, Math.min(params.limit ?? 100, 1000));
+  const rgFlags = ["-n", "--no-heading", "--color=never"];
+  if (params.ignoreCase) rgFlags.push("-i");
+  if (params.literal) rgFlags.push("-F");
+  if (params.context && params.context > 0) rgFlags.push("-C", String(Math.floor(params.context)));
+  if (params.glob) rgFlags.push("--glob", quoteShellPath(params.glob));
+
+  const grepFlags = ["-rn"];
+  if (params.ignoreCase) grepFlags.push("-i");
+  if (params.literal) grepFlags.push("-F");
+  if (params.context && params.context > 0) grepFlags.push("-C", String(Math.floor(params.context)));
+  if (params.glob) grepFlags.push(`--include=${quoteShellPath(params.glob)}`);
+
+  const pat = quoteShellPath(params.pattern);
+  const tgt = quoteShellPath(target);
+  const cmd =
+    `if command -v rg >/dev/null 2>&1; then ` +
+    `rg ${rgFlags.join(" ")} -- ${pat} ${tgt} | head -n ${limit}; ` +
+    `else ` +
+    `grep ${grepFlags.join(" ")} -- ${pat} ${tgt} | head -n ${limit}; ` +
+    `fi`;
+
+  const chunks: Buffer[] = [];
+  const res = await withSshClient(env, localCwd, (client) =>
+    execOnClient(client, cmd, {
+      onData: (d) => chunks.push(d),
+      signal: options?.signal,
+    }),
+  );
+  return {
+    output: Buffer.concat(chunks).toString("utf8"),
+    exitCode: res.exitCode,
+  };
 }
