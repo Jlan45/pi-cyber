@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { cp, copyFile } from "node:fs/promises";
 import {
-  cpSync,
-  copyFileSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -15,6 +14,7 @@ import {
   type CustomEntry,
   type SessionEntry,
   SessionManager,
+  getAgentDir,
 } from "@earendil-works/pi-coding-agent";
 import type { CyberModeId } from "./mode.ts";
 
@@ -25,6 +25,20 @@ export type SessionReader = Pick<
 >;
 
 export const CYBER_WORKSPACE_ENTRY_TYPE = "pi-cyber:workspace";
+
+const CYBER_WORKSPACE_STATE_KEY = "__piCyberActiveWorkspace";
+
+/** Process-wide active workspace shared across Pi's isolated extension module instances. */
+export function getActiveCyberWorkspace(): CyberWorkspaceState | null {
+  const value = (globalThis as Record<string, unknown>)[CYBER_WORKSPACE_STATE_KEY];
+  return value && typeof value === "object" && "workspaceDir" in value
+    ? (value as CyberWorkspaceState)
+    : null;
+}
+
+export function setActiveCyberWorkspace(workspace: CyberWorkspaceState | null): void {
+  (globalThis as Record<string, unknown>)[CYBER_WORKSPACE_STATE_KEY] = workspace;
+}
 
 export const CYBER_WORKSPACE_SUBDIRS = [
   "targets",
@@ -58,6 +72,31 @@ export interface CyberWorkspaceState {
   workspaceDir: string;
   engagementName: string;
   createdAt: string;
+}
+
+export function getCyberSettingsPath(): string {
+  return join(getAgentDir(), "pi-cyber", "settings.json");
+}
+
+/**
+ * Fixed parent directory for all engagement workspaces, independent of where pi was launched.
+ * Order: `PI_CYBER_ROOT` env, `workspaceRoot` in `~/.pi/agent/pi-cyber/settings.json`, `~/cyber-workspaces`.
+ */
+export function getCyberWorkspaceRoot(): string {
+  const fromEnv = process.env.PI_CYBER_ROOT?.trim();
+  if (fromEnv) return normalizeInputPath(fromEnv, homedir());
+  try {
+    const path = getCyberSettingsPath();
+    if (existsSync(path)) {
+      const parsed = JSON.parse(readFileSync(path, "utf8")) as { workspaceRoot?: unknown };
+      if (typeof parsed.workspaceRoot === "string" && parsed.workspaceRoot.trim()) {
+        return normalizeInputPath(parsed.workspaceRoot, homedir());
+      }
+    }
+  } catch {
+    // fall back to the default
+  }
+  return join(homedir(), "cyber-workspaces");
 }
 
 export function formatLocalDateTag(date: Date = new Date()): string {
@@ -149,9 +188,11 @@ function ensureWorkspaceLayout(workspaceDir: string): void {
  * Creates a `<name>-<YYYYMMDD>` engagement workspace under `rootCwd` with standard layout.
  */
 export function createCyberWorkspace(
-  rootCwd: string,
+  parentDir: string,
   engagementName: string,
   now: Date = new Date(),
+  /** Where pi was launched. Relative target paths resolve against it. Defaults to `parentDir`. */
+  launchCwd: string = parentDir,
 ): CyberWorkspaceState {
   const trimmed = engagementName.trim();
   if (!trimmed) {
@@ -160,7 +201,7 @@ export function createCyberWorkspace(
 
   const safeName = sanitizeWorkspaceName(trimmed);
   const dateTag = formatLocalDateTag(now);
-  const workspaceDir = allocateWorkspaceDir(rootCwd, safeName, dateTag);
+  const workspaceDir = allocateWorkspaceDir(parentDir, safeName, dateTag);
   const createdAt = now.toISOString();
 
   ensureWorkspaceLayout(workspaceDir);
@@ -191,7 +232,7 @@ export function createCyberWorkspace(
   );
 
   return {
-    rootCwd,
+    rootCwd: launchCwd,
     workspaceDir,
     engagementName: safeName,
     createdAt,
@@ -201,11 +242,11 @@ export function createCyberWorkspace(
 /**
  * Copies a local file/directory into `targets/` and updates the workspace manifest.
  */
-export function addTargetToWorkspace(
+export async function addTargetToWorkspace(
   workspace: CyberWorkspaceState,
   rawTargetPath: string,
   now: Date = new Date(),
-): CyberTargetSummary {
+): Promise<CyberTargetSummary> {
   const sourcePath = normalizeInputPath(rawTargetPath, workspace.rootCwd);
   if (!existsSync(sourcePath)) {
     throw new Error(`目标路径不存在: ${sourcePath}`);
@@ -233,13 +274,13 @@ export function addTargetToWorkspace(
 
   const destName = basename(copiedPath);
   if (kind === "directory") {
-    cpSync(sourcePath, copiedPath, {
+    await cp(sourcePath, copiedPath, {
       recursive: true,
       filter: (src) =>
         src !== workspace.workspaceDir && !src.startsWith(`${workspace.workspaceDir}${sep}`),
     });
   } else {
-    copyFileSync(sourcePath, copiedPath);
+    await copyFile(sourcePath, copiedPath);
   }
 
   const summary: CyberTargetSummary = {
@@ -285,10 +326,11 @@ export interface CyberProjectInfo {
 }
 
 /**
- * Lists Cyber engagement projects under `rootCwd` (immediate children with `.cyber/manifest.json`).
- * If `rootCwd` itself is a workspace, includes it and sibling workspaces under its parent.
+ * Lists Cyber engagement projects under each root (immediate children with `.cyber/manifest.json`).
+ * If a root is itself a workspace, includes it and sibling workspaces under its parent.
+ * Pass the fixed workspace root first and the launch cwd second to also find older, cwd-local projects.
  */
-export function listCyberProjects(rootCwd: string): CyberProjectInfo[] {
+export function listCyberProjects(...roots: string[]): CyberProjectInfo[] {
   const results: CyberProjectInfo[] = [];
   const seen = new Set<string>();
 
@@ -324,11 +366,13 @@ export function listCyberProjects(rootCwd: string): CyberProjectInfo[] {
     }
   };
 
-  if (isCyberWorkspaceDir(rootCwd)) {
-    tryAdd(rootCwd);
-    scanChildren(dirname(rootCwd));
-  } else {
-    scanChildren(rootCwd);
+  for (const root of roots) {
+    if (isCyberWorkspaceDir(root)) {
+      tryAdd(root);
+      scanChildren(dirname(root));
+    } else {
+      scanChildren(root);
+    }
   }
 
   return results.sort((a, b) => b.mtimeMs - a.mtimeMs);

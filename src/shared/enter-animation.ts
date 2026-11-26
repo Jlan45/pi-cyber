@@ -1,4 +1,5 @@
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { CYBER_MODES, type CyberModeId } from "./mode.ts";
 
 const LOGO = [
@@ -242,40 +243,18 @@ class CyberBootOverlay {
   }
 }
 
+/** Display width aware (CJK counts as 2 columns, ANSI codes as 0). */
 function padVisible(content: string, width: number): string {
-  const vis = printableWidth(content);
-  if (vis >= width) return truncatePrintable(content, width);
+  const vis = visibleWidth(content);
+  if (vis >= width) return truncateToWidth(content, width, "");
   return content + " ".repeat(width - vis);
 }
 
 function center(content: string, width: number): string {
-  const vis = printableWidth(content);
-  if (vis >= width) return truncatePrintable(content, width);
+  const vis = visibleWidth(content);
+  if (vis >= width) return truncateToWidth(content, width, "");
   const left = Math.floor((width - vis) / 2);
   return " ".repeat(left) + content;
-}
-
-function printableWidth(s: string): number {
-  return s.replace(/\x1b\[[0-9;]*m/g, "").length;
-}
-
-function truncatePrintable(s: string, width: number): string {
-  let out = "";
-  let vis = 0;
-  for (let i = 0; i < s.length; ) {
-    if (s[i] === "\x1b" && s[i + 1] === "[") {
-      const end = s.indexOf("m", i + 2);
-      if (end === -1) break;
-      out += s.slice(i, end + 1);
-      i = end + 1;
-      continue;
-    }
-    if (vis >= width) break;
-    out += s[i];
-    vis++;
-    i++;
-  }
-  return out;
 }
 
 function ansiRgb(r: number, g: number, b: number, text: string): string {

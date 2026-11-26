@@ -5,15 +5,15 @@ description: 逆向模式主流程。拿到样本后按类型路由到 Ghidra、
 
 # 逆向主流程
 
-流程参考 [reverse-skill](https://github.com/zhaoxuya520/reverse-skill) 的路由加阶段门闩，执行面换成 pi-cyber 的工作区和 `/reverse-tools`。只分析工作区 `targets/` 里已登记、且用户明确要分析的样本。不要执行未知样本，不要改原始文件，动态验证只在工作区副本上进行。
+流程参考 [reverse-skill](https://github.com/zhaoxuya520/reverse-skill) 的路由加阶段门闩，执行面换成 pi-cyber 的工作区和 `reverse_tool`。只分析工作区 `targets/` 里已登记、且用户明确要分析的样本。不要执行未知样本，不要改原始文件，动态验证只在工作区副本上进行。
 
 读完后直接做下一步，不要停在「已理解」。
 
 ## 1. 接入
 
-1. 确认当前是逆向模式，样本已在 `targets/`。没有就用 `/reverse <路径>` 或 `reverse_add_target`。
+1. 确认当前是逆向模式，样本已在 `targets/`。没有就让用户用 `/reverse <路径>`，或调用 `reverse_add_target`。
 2. 用 `file` 识别类型，再选一个主 MCP。路径以 `~/.pi/agent/pi-cyber/tool-paths.json` 为准，缺了就改这个文件，不要猜绝对路径。
-3. `/reverse-tools start <name>`。Ghidra 若返回 `[NOT_READY]`，立刻调用一次 `ghidra_wait_ready`，不要让用户干等。
+3. 按下表选好 MCP 后调用 `reverse_tool`，`action` 为 `start`，`name` 用表里的名字（IDA 是 `ida-pro`）。不要执行 `/reverse-tools`，那是给人用的命令。start 会等到 MCP 连上才返回，返回「启动成功」后 `mcp__<name>__*` 工具才可用，再去用 `reference`、`execute_python` 之类。返回失败就把原因告诉用户，不要重试同一条命令。同一工具已在运行时再次 start 不会重启；要换样本，传 `target`。Ghidra 若返回 `[NOT_READY]`，立刻调用一次 `ghidra_wait_ready`。
 
 | 类型 | 主 MCP | 接着做什么 |
 |------|--------|------------|

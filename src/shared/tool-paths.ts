@@ -15,12 +15,25 @@ function which(name: string): string {
   return found.stdout.trim().split("\n")[0]?.trim() ?? "";
 }
 
+const DETECT_CACHE_MS = 5 * 60 * 1000;
+const brewCache = new Map<string, { at: number; value: string }>();
+let detectedCache: { at: number; value: Record<string, string> } | null = null;
+
+/** `brew --prefix` is slow (~0.5s each) and macOS-only, so remember the answer for a few minutes. */
 function brewPrefix(formula: string): string {
-  if (!which("brew")) return "";
-  const found = spawnSync("brew", ["--prefix", formula], { encoding: "utf8" });
-  if (found.status !== 0) return "";
-  const prefix = found.stdout.trim();
-  return prefix && existsSync(prefix) ? prefix : "";
+  if (process.platform !== "darwin") return "";
+  const cached = brewCache.get(formula);
+  if (cached && Date.now() - cached.at < DETECT_CACHE_MS) return cached.value;
+  let value = "";
+  if (which("brew")) {
+    const found = spawnSync("brew", ["--prefix", formula], { encoding: "utf8" });
+    if (found.status === 0) {
+      const prefix = found.stdout.trim();
+      value = prefix && existsSync(prefix) ? prefix : "";
+    }
+  }
+  brewCache.set(formula, { at: Date.now(), value });
+  return value;
 }
 
 function expandHome(value: string): string {
@@ -90,7 +103,10 @@ function readUserPaths(file: string): Record<string, string> {
  */
 export function resolveToolPaths(): Record<string, string> {
   const file = getToolPathsFile();
-  const detected = detectToolPaths();
+  if (!detectedCache || Date.now() - detectedCache.at >= DETECT_CACHE_MS) {
+    detectedCache = { at: Date.now(), value: detectToolPaths() };
+  }
+  const detected = detectedCache.value;
   const user = readUserPaths(file);
   const merged = { ...detected };
   for (const [key, value] of Object.entries(user)) {

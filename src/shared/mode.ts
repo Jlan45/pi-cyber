@@ -37,35 +37,79 @@ export const CYBER_ONLY_COMMANDS = [
   "reverse-tools",
 ] as const;
 
-/** LLM tools declared only while a working mode is active. */
-export const CYBER_ONLY_TOOLS = [
-  "pentest_set_scope",
-  "pentest_check_scope",
-  "pentest_add_target",
-  "pentest_tool",
-  "pentest_set_execution",
-  "reverse_add_target",
-  "reverse_tool",
-  "ghidra_wait_ready",
-] as const;
+/** Commands that only make sense inside one specific mode. Others (mode switches) work in any mode. */
+export const CYBER_MODE_COMMANDS: Partial<Record<string, CyberModeId>> = {
+  runtime: "pentest",
+  "pentest-tools": "pentest",
+  "reverse-tools": "reverse",
+};
+
+/** LLM tools per working mode. Only the active mode's tools are declared to the model. */
+export const CYBER_TOOLS_BY_MODE: Record<CyberModeId, readonly string[]> = {
+  pentest: [
+    "pentest_set_scope",
+    "pentest_check_scope",
+    "pentest_add_target",
+    "pentest_tool",
+    "pentest_set_execution",
+    "pentest_fetch",
+  ],
+  reverse: ["reverse_add_target", "reverse_tool", "ghidra_wait_ready"],
+  attribution: [],
+  remediation: [],
+};
+
+/** Every cyber-only tool across modes (for hiding when no mode is active). */
+export const CYBER_ONLY_TOOLS: readonly string[] = Object.values(CYBER_TOOLS_BY_MODE).flat();
+
+export function getActiveCyberMode(): CyberModeId | null {
+  return readBroadcastMode();
+}
 
 export function isCyberModeActive(): boolean {
   return readBroadcastMode() !== null;
 }
 
-export function refuseOutsideCyberMode(ctx: { ui: { notify: (message: string, type?: "info" | "warning" | "error") => void } }): boolean {
-  if (isCyberModeActive()) return false;
-  ctx.ui.notify("请使用 /cyber 进入工作模式。", "warning");
-  return true;
+/**
+ * Returns true (and tells the user) when the command is not allowed right now.
+ * Without `mode`, any working mode is enough; with `mode`, that exact mode must be active.
+ */
+export function refuseOutsideCyberMode(
+  ctx: { ui: { notify: (message: string, type?: "info" | "warning" | "error") => void } },
+  mode?: CyberModeId,
+): boolean {
+  const current = readBroadcastMode();
+  if (current === null) {
+    ctx.ui.notify("请使用 /cyber 进入工作模式。", "warning");
+    return true;
+  }
+  if (mode && current !== mode) {
+    ctx.ui.notify(
+      `该命令只在「${CYBER_MODES[mode].label}」模式可用，当前是「${CYBER_MODES[current].label}」。用 /cyber ${mode} 切换。`,
+      "warning",
+    );
+    return true;
+  }
+  return false;
 }
 
-/** Show or hide cyber tools in the model tool list. Other active tools stay as they are. */
+/** Throws when a mode-specific tool is called outside its mode. Tools never switch modes on their own. */
+export function requireCyberMode(mode: CyberModeId): void {
+  const current = readBroadcastMode();
+  if (current !== mode) {
+    throw new Error(
+      `当前${current ? `是「${CYBER_MODES[current].label}」模式` : "未进入工作模式"}，该工具只在「${CYBER_MODES[mode].label}」模式可用。请先让用户执行 /cyber ${mode}。`,
+    );
+  }
+}
+
+/** Show only the active mode's tools to the model. Other active tools stay as they are. */
 export function syncCyberToolSurface(pi: ExtensionAPI): void {
   const active = new Set(pi.getActiveTools());
-  const enabled = isCyberModeActive();
-  for (const name of CYBER_ONLY_TOOLS) {
-    if (enabled) active.add(name);
-    else active.delete(name);
+  for (const name of CYBER_ONLY_TOOLS) active.delete(name);
+  const mode = readBroadcastMode();
+  if (mode) {
+    for (const name of CYBER_TOOLS_BY_MODE[mode]) active.add(name);
   }
   pi.setActiveTools([...active]);
 }
@@ -75,6 +119,8 @@ export interface CyberModeMeta {
   label: string;
   description: string;
   command: string;
+  /** False for modes that only exist as a placeholder: they are not offered in the selector. */
+  implemented: boolean;
 }
 
 export const CYBER_MODE_EVENT = "pi-cyber:mode-change";
@@ -88,24 +134,28 @@ export const CYBER_MODES: Record<CyberModeId, CyberModeMeta> = {
     label: "渗透",
     description: "渗透测试模式：信息收集、漏洞验证与安全评估",
     command: "pentest",
+    implemented: true,
   },
   reverse: {
     id: "reverse",
     label: "逆向",
     description: "逆向工程模式：二进制分析、反编译与协议还原",
     command: "reverse",
+    implemented: true,
   },
   attribution: {
     id: "attribution",
     label: "溯源",
     description: "溯源取证模式：日志分析、攻击链还原与 IOC 关联",
     command: "attribution",
+    implemented: false,
   },
   remediation: {
     id: "remediation",
     label: "漏洞修复",
     description: "漏洞修复模式：补丁生成、安全加固与回归验证",
     command: "remediation",
+    implemented: false,
   },
 };
 
@@ -138,12 +188,20 @@ export function registerModeModule(
   let active = false;
 
   pi.events.on(CYBER_MODE_EVENT, (data) => {
-    active = (data as CyberModeId | null) === meta.id;
+    const next =
+      data && typeof data === "object" && "mode" in data
+        ? (data as { mode: CyberModeId | null }).mode
+        : (data as CyberModeId | null);
+    active = next === meta.id;
   });
 
   pi.registerCommand(meta.command, {
     description: meta.description,
     handler: async (args, ctx) => {
+      if (!meta.implemented) {
+        ctx.ui.notify(`「${meta.label}」模式还没有实现。`, "warning");
+        return;
+      }
       if (refuseOutsideCyberMode(ctx)) return;
       await switchCyberMode(pi, ctx, meta.id, options?.resolveSwitchOptions?.(args, ctx));
       await options?.onCommand?.(args, ctx);
@@ -160,6 +218,8 @@ export interface SwitchCyberModeOptions {
   silent?: boolean;
   /** Skip the enter-mode boot overlay (e.g. tool auto-activate during agent turns). */
   skipAnimation?: boolean;
+  /** Skip persisting activeMode to workspace manifest (used when clearing stale process-wide mode). */
+  skipManifestUpdate?: boolean;
 }
 
 /**
@@ -174,7 +234,7 @@ export async function switchCyberMode(
 ): Promise<void> {
   const modeChanged = mode !== readBroadcastMode();
   writeBroadcastMode(mode);
-  pi.events.emit(CYBER_MODE_EVENT, mode);
+  pi.events.emit(CYBER_MODE_EVENT, { mode, skipManifestUpdate: options?.skipManifestUpdate === true });
 
   if (mode === null) {
     applyCyberEditorStyle(ctx, false);

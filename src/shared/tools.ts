@@ -18,7 +18,10 @@ export interface CyberToolConfig {
   mcp?: {
     exposure?: "direct" | "codemode" | "deferred" | "hidden";
     toolExposure?: Record<string, "direct" | "codemode" | "deferred" | "hidden">;
+    /** Per-request timeout in SECONDS (Pi's `timeout`). */
     timeout?: number;
+    /** How long a start may take before it counts as failed, in seconds. Default 180. */
+    startupTimeoutSec?: number;
   };
 }
 
@@ -32,6 +35,19 @@ export interface CyberToolRuntimeContext {
   sessionId: string;
   targetPath?: string;
   targetName?: string;
+}
+
+const DEFAULT_STARTUP_TIMEOUT_SEC = 180;
+
+interface CyberToolState {
+  status: CyberToolStatus;
+  toolDir?: string;
+  resolvedCommand?: string;
+  lastError?: string;
+  /** When the current start began (ms since epoch). */
+  startedAt?: number;
+  /** Identity of the registered config, so a repeated start of the same thing is a no-op. */
+  signature?: string;
 }
 
 export interface CyberToolStatusInfo {
@@ -221,6 +237,34 @@ export function loadCyberToolsConfig(configPath: string): CyberToolConfig[] {
   );
 }
 
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error("已取消"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error("已取消"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/** One-line result for a start that has finished connecting or failed. */
+export function formatStartOutcome(item: CyberToolStatusInfo, toolNames: string[]): string {
+  if (item.status === "running") {
+    const listed = toolNames.length > 0 ? toolNames.join("、") : "（已连接，但没有列出工具名）";
+    return `${item.name} 启动成功。MCP 已连接。可用工具：${listed}`;
+  }
+  const reason = item.lastError ?? "MCP 没有在时限内连上";
+  return `${item.name} 启动失败。${reason}`;
+}
+
 export function formatToolsStatusText(items: CyberToolStatusInfo[]): string {
   if (items.length === 0) {
     return "未配置任何工具。";
@@ -252,10 +296,7 @@ export class CyberToolManager {
   private readonly toolCommandName: string;
   private readonly configHint: string;
   private configs: CyberToolConfig[] = [];
-  private readonly states = new Map<
-    string,
-    { status: CyberToolStatus; toolDir?: string; resolvedCommand?: string; lastError?: string }
-  >();
+  private readonly states = new Map<string, CyberToolState>();
   private reconcileTimer: ReturnType<typeof setTimeout> | undefined;
   private reconcileGeneration = 0;
 
@@ -282,14 +323,21 @@ export class CyberToolManager {
     }
   }
 
+  private startupMs(name: string): number {
+    const cfg = this.configs.find((c) => c.name === name);
+    return (cfg?.mcp?.startupTimeoutSec ?? DEFAULT_STARTUP_TIMEOUT_SEC) * 1000;
+  }
+
   /**
    * Align local status with Pi's real MCP connection:
-   * registered + tools → running; registered + no tools → starting/error; else stopped.
+   * registered + tools → running; registered + no tools → starting (until its startup timeout),
+   * then error; running but tools gone → error; not registered → stopped.
    */
-  reconcileStatuses(options?: { failIfStillStarting?: boolean }): void {
+  reconcileStatuses(): void {
     const registered = this.getRegisteredServerNames();
+    const now = Date.now();
     for (const cfg of this.configs) {
-      const prev = this.states.get(cfg.name) ?? { status: "stopped" as CyberToolStatus };
+      const prev: CyberToolState = this.states.get(cfg.name) ?? { status: "stopped" };
       const isRegistered = registered.has(cfg.name);
       if (!isRegistered) {
         if (prev.status === "stopped" && !prev.lastError) continue;
@@ -299,6 +347,7 @@ export class CyberToolManager {
           ...prev,
           status: "stopped",
           lastError: undefined,
+          startedAt: undefined,
         });
         continue;
       }
@@ -308,49 +357,59 @@ export class CyberToolManager {
           ...prev,
           status: "running",
           lastError: undefined,
+          startedAt: undefined,
         });
         continue;
       }
 
-      if (options?.failIfStillStarting && (prev.status === "starting" || prev.status === "running")) {
+      if (prev.status === "running") {
         this.states.set(cfg.name, {
           ...prev,
           status: "error",
-          lastError: "MCP 连接失败或已断开（以 /mcp 为准）",
+          lastError: "MCP 连接已断开（工具列表里已没有它的工具，以 /mcp 为准）",
         });
         continue;
       }
 
-      if (prev.status !== "error") {
+      if (prev.status === "error") continue;
+
+      const startedAt = prev.startedAt ?? now;
+      if (now - startedAt > this.startupMs(cfg.name)) {
         this.states.set(cfg.name, {
           ...prev,
-          status: "starting",
-          lastError: undefined,
+          status: "error",
+          startedAt,
+          lastError: `启动超时（${Math.round(this.startupMs(cfg.name) / 1000)}s 内没有出现 MCP 工具）`,
         });
+        continue;
       }
+      this.states.set(cfg.name, { ...prev, status: "starting", startedAt, lastError: undefined });
     }
   }
 
-  /** Debounced multi-attempt reconcile after Pi finishes connecting registered servers. */
+  /** Poll until nothing is "starting" any more (Pi connects servers in the background). */
   scheduleReconcile(onUpdate?: () => void): void {
     const generation = ++this.reconcileGeneration;
     if (this.reconcileTimer) clearTimeout(this.reconcileTimer);
 
     const delays = [400, 1200, 3000, 6000];
+    const began = Date.now();
     let step = 0;
 
     const tick = () => {
       if (generation !== this.reconcileGeneration) return;
-      const isLast = step >= delays.length - 1;
-      this.reconcileStatuses({ failIfStillStarting: isLast });
+      this.reconcileStatuses();
       onUpdate?.();
+      const pending = [...this.states.values()].some((state) => state.status === "starting");
+      if (!pending || Date.now() - began > 20 * 60_000) return;
+      const next = step + 1 < delays.length ? delays[step + 1]! - delays[step]! : 5000;
       step += 1;
-      if (!isLast) {
-        this.reconcileTimer = setTimeout(tick, delays[step]! - delays[step - 1]!);
-      }
+      this.reconcileTimer = setTimeout(tick, next);
+      this.reconcileTimer.unref?.();
     };
 
     this.reconcileTimer = setTimeout(tick, delays[0]!);
+    this.reconcileTimer.unref?.();
   }
 
   reloadConfigOnly(): void {
@@ -422,28 +481,133 @@ export class CyberToolManager {
     };
   }
 
-  start(name: string, runtimeCtx: CyberToolRuntimeContext): CyberToolStatusInfo {
+  /**
+   * Register the MCP server. Returns "already" when the same config is already registered and
+   * starting or running, so a repeated start never kills a running analysis. `force` restarts.
+   */
+  private launch(
+    name: string,
+    runtimeCtx: CyberToolRuntimeContext,
+    force = false,
+  ): "started" | "already" {
     const entry = this.configs.find((c) => c.name === name);
     if (!entry) {
       throw new Error(`未找到名为 "${name}" 的${this.label}工具配置`);
     }
 
-    this.states.set(name, { status: "starting", lastError: undefined });
+    let built: ReturnType<CyberToolManager["buildMcpConfig"]>;
     try {
-      const { mcpConfig, toolDir, resolvedCommand } = this.buildMcpConfig(entry, runtimeCtx);
-      if (this.getRegisteredServerNames().has(name)) {
-        this.pi.unregisterMcpServer(name);
-      }
-      this.pi.registerMcpServer(name, mcpConfig);
-      // Stay "starting" until Pi actually connects and exposes mcp__<name>__* tools.
-      this.states.set(name, { status: "starting", toolDir, resolvedCommand });
-      this.scheduleReconcile();
+      built = this.buildMcpConfig(entry, runtimeCtx);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.states.set(name, { status: "error", lastError: message });
       throw error;
     }
 
+    const signature = JSON.stringify(built.mcpConfig);
+    this.reconcileStatuses();
+    const prev = this.states.get(name);
+    const registered = this.getRegisteredServerNames().has(name);
+    if (
+      !force &&
+      registered &&
+      prev?.signature === signature &&
+      (prev.status === "running" || prev.status === "starting")
+    ) {
+      return "already";
+    }
+
+    this.states.set(name, { status: "starting", lastError: undefined, startedAt: Date.now() });
+    try {
+      if (registered) {
+        this.pi.unregisterMcpServer(name);
+      }
+      this.pi.registerMcpServer(name, built.mcpConfig);
+      // Stay "starting" until Pi actually connects and exposes mcp__<name>__* tools.
+      this.states.set(name, {
+        status: "starting",
+        toolDir: built.toolDir,
+        resolvedCommand: built.resolvedCommand,
+        startedAt: Date.now(),
+        signature,
+      });
+      return "started";
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.states.set(name, { status: "error", lastError: message });
+      throw error;
+    }
+  }
+
+  start(
+    name: string,
+    runtimeCtx: CyberToolRuntimeContext,
+    options: { force?: boolean } = {},
+  ): CyberToolStatusInfo {
+    const outcome = this.launch(name, runtimeCtx, options.force === true);
+    if (outcome === "started") this.scheduleReconcile();
+    return this.getStatusList(name)[0];
+  }
+
+  /** Names of MCP tools Pi has exposed for this server. */
+  liveToolNames(name: string): string[] {
+    const prefix = `mcp__${name}__`;
+    try {
+      return this.pi.getAllTools().map((tool) => tool.name).filter((toolName) => toolName.startsWith(prefix));
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Register the server and block until its MCP tools appear, or the start fails or times out.
+   * Slash-command start stays non-blocking; tool calls use this so the model gets a final result.
+   * A repeated call for an already running server returns immediately without restarting it.
+   */
+  async startAndWait(
+    name: string,
+    runtimeCtx: CyberToolRuntimeContext,
+    options: {
+      timeoutMs?: number;
+      signal?: AbortSignal;
+      onUpdate?: (message: string) => void;
+      force?: boolean;
+    } = {},
+  ): Promise<CyberToolStatusInfo> {
+    const timeoutMs = options.timeoutMs ?? this.startupMs(name);
+    this.launch(name, runtimeCtx, options.force === true);
+    const started = Date.now();
+
+    while (Date.now() - started < timeoutMs) {
+      if (options.signal?.aborted) {
+        throw new Error("已取消");
+      }
+      this.reconcileStatuses();
+      const current = this.states.get(name);
+      if (current?.status === "running") return this.getStatusList(name)[0];
+      if (current?.status === "error") return this.getStatusList(name)[0];
+      if (!this.getRegisteredServerNames().has(name)) {
+        this.states.set(name, {
+          ...current,
+          status: "error",
+          lastError: current?.lastError ?? "MCP 注册被移除，没有连上",
+        });
+        return this.getStatusList(name)[0];
+      }
+      const elapsed = Math.round((Date.now() - started) / 1000);
+      options.onUpdate?.(`${name} 启动中，已等待 ${elapsed}s（上限 ${Math.round(timeoutMs / 1000)}s）`);
+      await sleep(1000, options.signal);
+    }
+
+    this.reconcileStatuses();
+    const current = this.states.get(name);
+    if (current?.status !== "running") {
+      this.states.set(name, {
+        ...current,
+        status: "error",
+        lastError: `启动超时（${Math.round(timeoutMs / 1000)}s 内没有出现 MCP 工具）。可能是依赖还在下载、路径配置不对或进程已退出；在终端手动运行该命令可看到具体报错。`,
+      });
+    }
     return this.getStatusList(name)[0];
   }
 
@@ -480,7 +644,7 @@ export class CyberToolManager {
     this.reloadConfigOnly();
 
     if (name) {
-      return [this.start(name, runtimeCtx)];
+      return [this.start(name, runtimeCtx, { force: true })];
     }
 
     const targets = this.configs.filter(
@@ -488,7 +652,7 @@ export class CyberToolManager {
     );
     for (const cfg of targets) {
       try {
-        this.start(cfg.name, runtimeCtx);
+        this.start(cfg.name, runtimeCtx, { force: true });
       } catch {
         // Error state is recorded in `this.states` for status inspection.
       }
@@ -558,5 +722,90 @@ export class CyberToolManager {
       );
     }
     return lines.join("\n");
+  }
+}
+
+/** Shared execution logic for `<mode>_tool` lifecycle tools. */
+export async function executeToolLifecycleAction(
+  manager: CyberToolManager,
+  action: CyberToolAction,
+  name: string | undefined,
+  runtimeCtx: CyberToolRuntimeContext,
+  options?: {
+    signal?: AbortSignal;
+    onUpdate?: (message: string) => void;
+    onStop?: (name: string) => void;
+  },
+): Promise<{ text: string; tools: CyberToolStatusInfo[] }> {
+  switch (action) {
+    case "status": {
+      const tools = manager.getStatusList(name);
+      return { tools, text: formatToolsStatusText(tools) };
+    }
+    case "start": {
+      if (!name) throw new Error("action=start 时必须指定工具名称 name");
+      const info = await manager.startAndWait(name, runtimeCtx, {
+        signal: options?.signal,
+        onUpdate: options?.onUpdate,
+      });
+      return {
+        tools: [info],
+        text: formatStartOutcome(info, manager.liveToolNames(name)),
+      };
+    }
+    case "stop": {
+      if (!name) throw new Error("action=stop 时必须指定工具名称 name");
+      options?.onStop?.(name);
+      const info = manager.stop(name);
+      return { tools: [info], text: `${name} 已停止。` };
+    }
+    case "reload": {
+      const tools = manager.reload(runtimeCtx, name);
+      return { tools, text: formatToolsStatusText(tools) };
+    }
+    default:
+      throw new Error(`未知 action: ${String(action)}`);
+  }
+}
+
+/** Shared slash-command handler for `/pentest-tools` and `/reverse-tools`. */
+export function handleToolsSlashCommand(
+  manager: CyberToolManager,
+  args: string,
+  runtimeCtx: CyberToolRuntimeContext,
+  options: {
+    commandName: string;
+    label: string;
+    notify: (message: string, type?: "info" | "warning" | "error") => void;
+    onAfter?: () => void;
+  },
+): void {
+  const [sub = "status", name] = args.trim().split(/\s+/);
+  try {
+    if (sub === "status") {
+      options.onAfter?.();
+      options.notify(formatToolsStatusText(manager.getStatusList(name)), "info");
+    } else if (sub === "start" && name) {
+      const info = manager.start(name, runtimeCtx);
+      options.onAfter?.();
+      options.notify(`已启动并注入 MCP: ${info.name} (status=${info.status})`, "info");
+    } else if (sub === "stop" && name) {
+      const info = manager.stop(name);
+      options.onAfter?.();
+      options.notify(`已停止并卸载 MCP: ${info.name} (status=${info.status})`, "info");
+    } else if (sub === "reload") {
+      const items = manager.reload(runtimeCtx, name);
+      options.onAfter?.();
+      options.notify(`已重载${options.label}工具配置:\n${formatToolsStatusText(items)}`, "info");
+    } else {
+      options.notify(
+        `用法: /${options.commandName} [status | start <name> | stop <name> | reload [name]]`,
+        "warning",
+      );
+    }
+  } catch (error) {
+    options.onAfter?.();
+    const message = error instanceof Error ? error.message : String(error);
+    options.notify(`${options.label}工具操作失败: ${message}`, "error");
   }
 }

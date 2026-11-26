@@ -1,8 +1,10 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { createHash, createHmac } from "node:crypto";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join, posix, resolve } from "node:path";
 import { getAgentDir, type BashOperations } from "@earendil-works/pi-coding-agent";
 import { Client, type ConnectConfig } from "ssh2";
-import { normalizeInputPath } from "./workspace.ts";
+import { normalizeInputPath, quoteShellPath } from "./workspace.ts";
 
 export type ExecutionEnvType = "local" | "ssh";
 
@@ -14,8 +16,6 @@ export interface SshAuthConfig {
   user?: string;
   /** Private key path (supports `~`). */
   identityFile?: string;
-  /** Optional certificate for the identity (ssh `-o CertificateFile=`). */
-  certificateFile?: string;
   /** Passphrase for an encrypted key (stored in plaintext — avoid when possible). */
   passphrase?: string;
   /** Account password when method=password (stored in plaintext — avoid when possible). */
@@ -37,8 +37,11 @@ export interface SshExecutionEnv {
   port?: number;
   remoteCwd?: string;
   auth?: SshAuthConfig;
-  /** Extra ssh argv before destination. */
-  extraArgs?: string[];
+  /**
+   * Host key policy. `accept-new` (default): trust a host on first contact, then pin it; a changed key
+   * is refused. `strict`: only hosts already in known_hosts. `off`: no verification (not recommended).
+   */
+  hostKeyCheck?: "strict" | "accept-new" | "off";
 }
 
 export type ExecutionEnvironment = LocalExecutionEnv | SshExecutionEnv;
@@ -51,6 +54,8 @@ export interface ExecutionConfigFile {
 }
 
 export interface ResolvedExecution {
+  /** Set when an execution file exists but cannot be read. Shell commands must be refused, not run locally. */
+  error?: string;
   active: string;
   env: ExecutionEnvironment;
   /** Merged catalogue (workspace entries override global by name). */
@@ -79,8 +84,9 @@ function readJsonFile(path: string): unknown | null {
   if (!existsSync(path)) return null;
   try {
     return JSON.parse(readFileSync(path, "utf8"));
-  } catch {
-    return null;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${path} 不是有效的 JSON: ${message}`);
   }
 }
 
@@ -118,8 +124,8 @@ export function normalizeEnvironment(raw: unknown): ExecutionEnvironment {
   if (typeof obj.remoteCwd === "string" && obj.remoteCwd.trim()) {
     env.remoteCwd = obj.remoteCwd.trim();
   }
-  if (Array.isArray(obj.extraArgs)) {
-    env.extraArgs = obj.extraArgs.filter((x): x is string => typeof x === "string");
+  if (obj.hostKeyCheck === "strict" || obj.hostKeyCheck === "accept-new" || obj.hostKeyCheck === "off") {
+    env.hostKeyCheck = obj.hostKeyCheck;
   }
 
   const authRaw = obj.auth;
@@ -132,9 +138,6 @@ export function normalizeEnvironment(raw: unknown): ExecutionEnvironment {
     if (typeof a.user === "string" && a.user.trim()) auth.user = a.user.trim();
     if (typeof a.identityFile === "string" && a.identityFile.trim()) {
       auth.identityFile = a.identityFile.trim();
-    }
-    if (typeof a.certificateFile === "string" && a.certificateFile.trim()) {
-      auth.certificateFile = a.certificateFile.trim();
     }
     if (typeof a.passphrase === "string" && a.passphrase) auth.passphrase = a.passphrase;
     if (typeof a.password === "string" && a.password) auth.password = a.password;
@@ -209,20 +212,32 @@ export function normalizeExecutionFile(raw: unknown): ExecutionConfigFile {
   return { active, environments };
 }
 
+/**
+ * Reads an execution file. Returns null only when the file does not exist.
+ * Throws when it exists but is invalid, so a typo can never silently turn into "run locally"
+ * (or get overwritten by a default file).
+ */
 export function readExecutionFile(path: string): ExecutionConfigFile | null {
   const raw = readJsonFile(path);
   if (raw === null) return null;
   try {
     return normalizeExecutionFile(raw);
-  } catch {
-    return null;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${path} 配置无效: ${message}`);
   }
 }
 
+/** Execution files may hold passwords or passphrases: keep them private to the user. */
 export function writeExecutionFile(path: string, config: ExecutionConfigFile): void {
   const normalized = normalizeExecutionFile(config);
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(normalized, null, 2)}\n`, "utf8");
+  writeFileSync(path, `${JSON.stringify(normalized, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  try {
+    chmodSync(path, 0o600);
+  } catch {
+    // best effort (e.g. Windows)
+  }
 }
 
 function mergeEnvironments(
@@ -243,8 +258,17 @@ function mergeEnvironments(
  * Resolve effective execution: global defaults, workspace overrides by name, workspace `active` wins.
  */
 export function resolveExecution(workspaceDir?: string | null): ResolvedExecution {
-  const globalFile = readExecutionFile(getGlobalExecutionPath()) ?? defaultExecutionFile();
-  const workspaceFile = workspaceDir ? readExecutionFile(getWorkspaceExecutionPath(workspaceDir)) : null;
+  let error: string | undefined;
+  const tryRead = (path: string): ExecutionConfigFile | null => {
+    try {
+      return readExecutionFile(path);
+    } catch (err) {
+      error = [error, err instanceof Error ? err.message : String(err)].filter(Boolean).join("；");
+      return null;
+    }
+  };
+  const globalFile = tryRead(getGlobalExecutionPath()) ?? defaultExecutionFile();
+  const workspaceFile = workspaceDir ? tryRead(getWorkspaceExecutionPath(workspaceDir)) : null;
 
   const environments = mergeEnvironments(
     globalFile.environments,
@@ -265,7 +289,18 @@ export function resolveExecution(workspaceDir?: string | null): ResolvedExecutio
     source = "global";
   }
 
-  return { active: env.name, env, environments, source };
+  return { active: env.name, env, environments, source, ...(error ? { error } : {}) };
+}
+
+const REMOTE_EXEC_ACTIVE_KEY = "__piCyberRemoteExecActive";
+
+/** Tracks whether the active pentest runtime routes bash over SSH (shared across extension modules). */
+export function setRemoteExecutionActive(active: boolean): void {
+  (globalThis as Record<string, unknown>)[REMOTE_EXEC_ACTIVE_KEY] = active;
+}
+
+export function isRemoteExecutionActive(): boolean {
+  return (globalThis as Record<string, unknown>)[REMOTE_EXEC_ACTIVE_KEY] === true;
 }
 
 export function isSshEnvironment(env: ExecutionEnvironment): env is SshExecutionEnv {
@@ -289,6 +324,15 @@ export function formatExecutionSummary(resolved: ResolvedExecution): string {
 export function formatExecutionPromptSection(resolved: ResolvedExecution): string {
   const lines: string[] = [];
 
+  if (resolved.error) {
+    lines.push(
+      "【阻断】执行环境配置无效，bash 工具和用户 `!` 命令已被禁用，不会回退到本机。",
+      `原因: ${resolved.error}`,
+      "请让用户修正该文件（或用 /runtime 重新配置）后再继续，不要尝试绕过。",
+    );
+    return lines.join("\n");
+  }
+
   if (isSshEnvironment(resolved.env)) {
     const user = resolved.env.auth?.user?.trim();
     const host = resolved.env.target.includes("@")
@@ -303,6 +347,7 @@ export function formatExecutionPromptSection(resolved: ResolvedExecution): strin
       `所有 bash 工具调用与用户 \`!\` / \`!!\` 命令一律在远程主机 ${host}${port} 上执行${cwd}（来源: ${resolved.source}，环境名: ${resolved.env.name}）。`,
       "禁止假设命令在本机运行；本机路径、本机 localhost、本机进程与本机网络均不适用。",
       "read / write / edit / MCP 仍在本机；只有 shell 命令通道走远程。",
+      "远程命令写出的文件（nmap -oA、截图、抓包等）在远端磁盘上，本机 read 看不到。需要留证时调用 `pentest_fetch` 把远端文件或目录拉回本机 evidence/，再 read。",
       "远程连接经 ssh2 复用，空闲约 5 分钟断开。",
     );
   } else {
@@ -328,12 +373,6 @@ export function resolveIdentityFile(identityFile: string, baseCwd: string): stri
   return normalizeInputPath(identityFile, baseCwd);
 }
 
-function sshDestination(env: SshExecutionEnv): string {
-  if (env.target.includes("@")) return env.target;
-  const user = env.auth?.user?.trim();
-  return user ? `${user}@${env.target}` : env.target;
-}
-
 function parseSshHostUser(env: SshExecutionEnv): { host: string; username: string } {
   let host = env.target.trim();
   let username = env.auth?.user?.trim() || process.env.USER || "root";
@@ -346,17 +385,135 @@ function parseSshHostUser(env: SshExecutionEnv): { host: string; username: strin
   return { host, username };
 }
 
-function buildConnectConfig(env: SshExecutionEnv, localCwd: string): ConnectConfig {
+// ---------------------------------------------------------------------------
+// Host key verification
+// ---------------------------------------------------------------------------
+
+function pinnedHostsPath(): string {
+  return join(getAgentDir(), "pi-cyber", "known_hosts");
+}
+
+function knownHostsFiles(): string[] {
+  return [join(homedir(), ".ssh", "known_hosts"), pinnedHostsPath()];
+}
+
+function hostLabel(host: string, port: number): string {
+  return port === 22 ? host : `[${host}]:${port}`;
+}
+
+function hostFieldMatches(field: string, label: string): boolean {
+  for (const entry of field.split(",")) {
+    if (entry.startsWith("|1|")) {
+      const [, , salt, hash] = entry.split("|");
+      if (!salt || !hash) continue;
+      const digest = createHmac("sha1", Buffer.from(salt, "base64")).update(label).digest("base64");
+      if (digest === hash) return true;
+    } else if (entry === label) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function keyTypeOf(key: Buffer): string {
+  try {
+    const len = key.readUInt32BE(0);
+    return key.subarray(4, 4 + len).toString("utf8");
+  } catch {
+    return "";
+  }
+}
+
+type KnownHostResult = "match" | "mismatch" | "unknown";
+
+/** `mismatch` only when the host is pinned with the same key type but a different key. */
+function lookupKnownHost(host: string, port: number, key: Buffer): KnownHostResult {
+  const label = hostLabel(host, port);
+  const type = keyTypeOf(key);
+  const b64 = key.toString("base64");
+  let mismatch = false;
+  for (const file of knownHostsFiles()) {
+    if (!existsSync(file)) continue;
+    let text = "";
+    try {
+      text = readFileSync(file, "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith("@")) continue;
+      const [hosts, entryType, entryKey] = trimmed.split(/\s+/);
+      if (!hosts || !entryType || !entryKey) continue;
+      if (!hostFieldMatches(hosts, label)) continue;
+      if (entryType !== type) continue;
+      if (entryKey === b64) return "match";
+      mismatch = true;
+    }
+  }
+  return mismatch ? "mismatch" : "unknown";
+}
+
+function pinHost(host: string, port: number, key: Buffer): void {
+  const file = pinnedHostsPath();
+  mkdirSync(dirname(file), { recursive: true });
+  appendFileSync(file, `${hostLabel(host, port)} ${keyTypeOf(key)} ${key.toString("base64")}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+}
+
+function fingerprintOf(key: Buffer): string {
+  return `SHA256:${createHash("sha256").update(key).digest("base64").replace(/=+$/, "")}`;
+}
+
+interface ConnectState {
+  hostKeyError?: string;
+}
+
+function buildConnectConfig(
+  env: SshExecutionEnv,
+  localCwd: string,
+  state: ConnectState,
+): ConnectConfig {
   const { host, username } = parseSshHostUser(env);
   const auth = env.auth;
   const method = auth?.method ?? (auth?.identityFile ? "key" : "agent");
+  const port = env.port && env.port > 0 ? env.port : 22;
   const config: ConnectConfig = {
     host,
-    port: env.port && env.port > 0 ? env.port : 22,
+    port,
     username,
     readyTimeout: 20_000,
     keepaliveInterval: 15_000,
   };
+
+  const policy = env.hostKeyCheck ?? "accept-new";
+  if (policy !== "off") {
+    config.hostVerifier = (key: Buffer) => {
+      const result = lookupKnownHost(host, port, key);
+      if (result === "match") return true;
+      const fingerprint = fingerprintOf(key);
+      if (result === "mismatch") {
+        state.hostKeyError =
+          `主机 ${hostLabel(host, port)} 的密钥与已记录的不一致（${fingerprint}），可能被中间人劫持。` +
+          `确认该主机确实重装过后，再从 ~/.ssh/known_hosts 或 ${pinnedHostsPath()} 删除旧记录。`;
+        return false;
+      }
+      if (policy === "strict") {
+        state.hostKeyError =
+          `主机 ${hostLabel(host, port)} 不在 known_hosts 中（${fingerprint}）。` +
+          `先用 ssh 连一次确认指纹，或把该环境的 hostKeyCheck 改成 accept-new。`;
+        return false;
+      }
+      try {
+        pinHost(host, port, key);
+      } catch {
+        // pinning is best effort; the connection itself is still allowed under accept-new
+      }
+      return true;
+    };
+  }
 
   if (method === "password") {
     if (!auth?.password) throw new Error(`SSH 环境 "${env.name}" 缺少 password`);
@@ -377,12 +534,18 @@ function buildConnectConfig(env: SshExecutionEnv, localCwd: string): ConnectConf
   return config;
 }
 
+// ---------------------------------------------------------------------------
+// Connection pool
+// ---------------------------------------------------------------------------
+
 const SSH_IDLE_MS = 5 * 60 * 1000;
 
 interface PooledSshClient {
   key: string;
   client: Client;
   ready: Promise<Client>;
+  /** Commands / transfers currently using this connection. It is never idle-closed while busy. */
+  active: number;
   idleTimer?: ReturnType<typeof setTimeout>;
 }
 
@@ -398,7 +561,7 @@ function poolKey(env: SshExecutionEnv): string {
       : method === "key"
         ? `key:${auth?.identityFile ?? ""}:${auth?.passphrase ?? ""}`
         : "agent";
-  return `${env.name}|${username}@${host}:${env.port ?? 22}|${method}|${secret}`;
+  return `${env.name}|${username}@${host}:${env.port ?? 22}|${method}|${env.hostKeyCheck ?? ""}|${secret}`;
 }
 
 function clearIdleTimer(entry: PooledSshClient): void {
@@ -410,7 +573,9 @@ function clearIdleTimer(entry: PooledSshClient): void {
 
 function scheduleIdleClose(entry: PooledSshClient): void {
   clearIdleTimer(entry);
+  if (entry.active > 0) return;
   entry.idleTimer = setTimeout(() => {
+    if (entry.active > 0) return;
     if (sshPool.get(entry.key) === entry) sshPool.delete(entry.key);
     try {
       entry.client.end();
@@ -439,13 +604,14 @@ export function closeAllSshConnections(): void {
   sshPool.clear();
 }
 
-async function acquireSshClient(env: SshExecutionEnv, localCwd: string): Promise<Client> {
+async function acquireSshEntry(env: SshExecutionEnv, localCwd: string): Promise<PooledSshClient> {
   const key = poolKey(env);
   const existing = sshPool.get(key);
   if (existing) {
     clearIdleTimer(existing);
     try {
-      return await existing.ready;
+      await existing.ready;
+      return existing;
     } catch {
       dropPoolEntry(existing);
     }
@@ -456,7 +622,9 @@ async function acquireSshClient(env: SshExecutionEnv, localCwd: string): Promise
     key,
     client,
     ready: Promise.resolve(client),
+    active: 0,
   };
+  const state: ConnectState = {};
 
   entry.ready = new Promise<Client>((resolvePromise, reject) => {
     const onReady = () => {
@@ -466,14 +634,14 @@ async function acquireSshClient(env: SshExecutionEnv, localCwd: string): Promise
     const onConnectError = (err: Error) => {
       client.off("ready", onReady);
       dropPoolEntry(entry);
-      reject(err);
+      reject(state.hostKeyError ? new Error(state.hostKeyError) : err);
     };
     client.once("ready", onReady);
     client.once("error", onConnectError);
     client.on("close", () => dropPoolEntry(entry));
     client.on("end", () => dropPoolEntry(entry));
     try {
-      client.connect(buildConnectConfig(env, localCwd));
+      client.connect(buildConnectConfig(env, localCwd, state));
     } catch (err) {
       dropPoolEntry(entry);
       reject(err instanceof Error ? err : new Error(String(err)));
@@ -481,7 +649,47 @@ async function acquireSshClient(env: SshExecutionEnv, localCwd: string): Promise
   });
 
   sshPool.set(key, entry);
-  return entry.ready;
+  await entry.ready;
+  return entry;
+}
+
+/** Run `fn` on a pooled connection and keep it from idle-closing while `fn` runs. */
+async function withSshClient<T>(
+  env: SshExecutionEnv,
+  localCwd: string,
+  fn: (client: Client) => Promise<T>,
+): Promise<T> {
+  const entry = await acquireSshEntry(env, localCwd);
+  entry.active += 1;
+  clearIdleTimer(entry);
+  try {
+    return await fn(entry.client);
+  } finally {
+    entry.active -= 1;
+    if (entry.active === 0 && sshPool.get(entry.key) === entry) scheduleIdleClose(entry);
+  }
+}
+
+function discardPooled(env: SshExecutionEnv): void {
+  const stale = sshPool.get(poolKey(env));
+  if (!stale) return;
+  dropPoolEntry(stale);
+  try {
+    stale.client.end();
+  } catch {
+    // ignore
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Remote commands
+// ---------------------------------------------------------------------------
+
+/** Quote a remote path for sh, keeping a leading `~` working. */
+export function quoteRemotePath(value: string): string {
+  if (value === "~") return `"$HOME"`;
+  if (value.startsWith("~/")) return `"$HOME"/${quoteShellPath(value.slice(2))}`;
+  return quoteShellPath(value);
 }
 
 export function stripLeadingLocalCd(command: string, localDirs: string[]): string {
@@ -498,6 +706,14 @@ export function stripLeadingLocalCd(command: string, localDirs: string[]): strin
   const known = new Set(localDirs.map((d) => resolve(d)));
   if (known.has(resolvedDir)) return rest;
   return command;
+}
+
+/** The channel could not be opened, so the command never started and a retry is safe. */
+class SshSetupError extends Error {
+  constructor(cause: Error) {
+    super(cause.message);
+    this.name = "SshSetupError";
+  }
 }
 
 function execOnClient(
@@ -518,17 +734,28 @@ function execOnClient(
 
     client.exec(remoteBody, (err, stream) => {
       if (err) {
-        reject(err);
+        reject(new SshSetupError(err));
         return;
       }
 
       let timedOut = false;
       let settled = false;
+
+      /** Ask the remote process to stop (OpenSSH 7.9+), then drop the channel. */
+      const terminate = () => {
+        try {
+          stream.signal("TERM");
+        } catch {
+          // server may not support signals
+        }
+        stream.close();
+      };
+
       const timer =
         timeout !== undefined
           ? setTimeout(() => {
               timedOut = true;
-              stream.close();
+              terminate();
             }, timeout * 1000)
           : undefined;
 
@@ -541,7 +768,7 @@ function execOnClient(
       };
 
       const onAbort = () => {
-        stream.close();
+        terminate();
         finish(() => reject(new Error("aborted")));
       };
       signal?.addEventListener("abort", onAbort, { once: true });
@@ -566,6 +793,7 @@ function execOnClient(
 
 /**
  * BashOperations backed by ssh2 with connection reuse (one Client per env, idle close 5m).
+ * A command is retried only when its channel could not be opened; once it started it never runs twice.
  */
 export function createSshBashOperations(
   env: SshExecutionEnv,
@@ -581,41 +809,111 @@ export function createSshBashOperations(
     exec: async (command, _cwd, execOptions) => {
       const stripped = stripLeadingLocalCd(command, localDirs);
       const remoteBody = env.remoteCwd
-        ? `cd ${JSON.stringify(env.remoteCwd)} && ${stripped}`
+        ? `cd ${quoteRemotePath(env.remoteCwd)} && ${stripped}`
         : stripped;
 
-      const run = async () => {
-        const client = await acquireSshClient(env, localCwd);
-        const result = await execOnClient(client, remoteBody, execOptions);
-        const entry = sshPool.get(poolKey(env));
-        if (entry) scheduleIdleClose(entry);
-        return result;
-      };
+      const attempt = () =>
+        withSshClient(env, localCwd, (client) => execOnClient(client, remoteBody, execOptions));
 
       try {
-        return await run();
+        return await attempt();
       } catch (err) {
-        if (
-          err instanceof Error &&
-          (err.message === "aborted" || err.message.startsWith("timeout:"))
-        ) {
-          throw err;
-        }
-        // Drop broken connection and retry once
-        const key = poolKey(env);
-        const stale = sshPool.get(key);
-        if (stale) {
-          dropPoolEntry(stale);
-          try {
-            stale.client.end();
-          } catch {
-            // ignore
-          }
-        }
-        return await run();
+        if (!(err instanceof SshSetupError)) throw err;
+        discardPooled(env);
+        return await attempt();
       }
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Fetching remote artifacts (SFTP)
+// ---------------------------------------------------------------------------
+
+export interface FetchResult {
+  files: number;
+  bytes: number;
+  localPath: string;
+}
+
+const FETCH_MAX_FILES = 5000;
+const FETCH_MAX_BYTES = 1024 * 1024 * 1024;
+
+function sftpCall<T>(
+  fn: (done: (err: Error | null | undefined, value?: T) => void) => void,
+): Promise<T> {
+  return new Promise((resolvePromise, reject) => {
+    fn((err, value) => (err ? reject(err) : resolvePromise(value as T)));
+  });
+}
+
+/**
+ * Copy a remote file or directory to `localDest` over SFTP. Relative remote paths resolve against the
+ * environment's `remoteCwd` (or the login directory). Symlinks are skipped; names sent by the server
+ * are validated so they cannot escape `localDest`.
+ */
+export async function fetchRemotePath(
+  env: SshExecutionEnv,
+  remotePath: string,
+  localDest: string,
+  options?: { localCwd?: string; signal?: AbortSignal },
+): Promise<FetchResult> {
+  const localCwd = options?.localCwd ?? process.cwd();
+  return withSshClient(env, localCwd, async (client) => {
+    const sftp = await sftpCall<import("ssh2").SFTPWrapper>((done) => client.sftp(done));
+    try {
+      const home = await sftpCall<string>((done) => sftp.realpath(".", done));
+      const expand = (p: string) =>
+        p === "~" ? home : p.startsWith("~/") ? posix.join(home, p.slice(2)) : p;
+      const base = expand(env.remoteCwd ?? home);
+      const start = posix.isAbsolute(expand(remotePath))
+        ? posix.normalize(expand(remotePath))
+        : posix.join(base, expand(remotePath));
+
+      let files = 0;
+      let bytes = 0;
+      const checkLimits = (size: number) => {
+        files += 1;
+        bytes += size;
+        if (files > FETCH_MAX_FILES) throw new Error(`文件数超过上限 ${FETCH_MAX_FILES}，请缩小范围或先在远端打包`);
+        if (bytes > FETCH_MAX_BYTES) throw new Error("总大小超过 1 GiB，请缩小范围或先在远端打包");
+      };
+
+      const copyFile = async (remote: string, local: string, size: number) => {
+        if (options?.signal?.aborted) throw new Error("aborted");
+        checkLimits(size);
+        mkdirSync(dirname(local), { recursive: true });
+        await sftpCall<void>((done) => sftp.fastGet(remote, local, (err) => done(err)));
+      };
+
+      const copyDir = async (remote: string, local: string): Promise<void> => {
+        mkdirSync(local, { recursive: true });
+        const entries = await sftpCall<import("ssh2").FileEntryWithStats[]>((done) =>
+          sftp.readdir(remote, done),
+        );
+        for (const entry of entries) {
+          const name = entry.filename;
+          if (!name || name === "." || name === ".." || name.includes("/") || name.includes("\0")) continue;
+          if (entry.attrs.isSymbolicLink()) continue;
+          const remoteChild = posix.join(remote, name);
+          const localChild = join(local, name);
+          if (entry.attrs.isDirectory()) await copyDir(remoteChild, localChild);
+          else if (entry.attrs.isFile()) await copyFile(remoteChild, localChild, entry.attrs.size);
+        }
+      };
+
+      const stats = await sftpCall<import("ssh2").Stats>((done) => sftp.stat(start, done));
+      if (stats.isDirectory()) await copyDir(start, localDest);
+      else await copyFile(start, localDest, stats.size);
+      return { files, bytes, localPath: localDest };
+    } finally {
+      try {
+        sftp.end();
+      } catch {
+        // ignore
+      }
+    }
+  });
 }
 
 /** Upsert an environment into a config file and optionally set it active. */

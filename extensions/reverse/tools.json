@@ -11,7 +11,8 @@
       "autoStart": false,
       "mcp": {
         "exposure": "direct",
-        "timeout": 600000
+        "timeout": 600,
+        "startupTimeoutSec": 300
       }
     },
     {
@@ -28,7 +29,8 @@
       "autoStart": false,
       "mcp": {
         "exposure": "direct",
-        "timeout": 600000
+        "timeout": 600,
+        "startupTimeoutSec": 600
       }
     },
     {
@@ -38,7 +40,8 @@
       "autoStart": false,
       "mcp": {
         "exposure": "direct",
-        "timeout": 120000
+        "timeout": 120,
+        "startupTimeoutSec": 60
       }
     },
     {
@@ -53,7 +56,8 @@
       "autoStart": false,
       "mcp": {
         "exposure": "direct",
-        "timeout": 300000
+        "timeout": 300,
+        "startupTimeoutSec": 120
       }
     },
     {
@@ -68,7 +72,8 @@
       "autoStart": false,
       "mcp": {
         "exposure": "direct",
-        "timeout": 300000
+        "timeout": 300,
+        "startupTimeoutSec": 180
       }
     },
     {
@@ -82,7 +87,8 @@
       "autoStart": false,
       "mcp": {
         "exposure": "direct",
-        "timeout": 120000
+        "timeout": 120,
+        "startupTimeoutSec": 300
       }
     }
   ]

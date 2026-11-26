@@ -9,6 +9,7 @@ See the file 'LICENSE' for copying permission
 """
 
 import logging
+import sys
 import subprocess
 import os
 import shutil
@@ -24,7 +25,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # Console handler for logging to the console
-console_handler = logging.StreamHandler()
+console_handler = logging.StreamHandler(sys.stderr)
 console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(console_handler)
@@ -1787,61 +1788,61 @@ async def get_workspace_info() -> Dict:
         }
 
 def main():
-    print("=" * 80)
-    print("APKTool MCP Server")
-    print("By ZinjaCoder (https://github.com/zinja-coder)")
-    print("To Report Issues: https://github.com/zinja-coder/apktool-mcp-server/issues")
-    print("=" * 80)
-    print()
+    print("=" * 80, file=sys.stderr)
+    print("APKTool MCP Server", file=sys.stderr)
+    print("By ZinjaCoder (https://github.com/zinja-coder)", file=sys.stderr)
+    print("To Report Issues: https://github.com/zinja-coder/apktool-mcp-server/issues", file=sys.stderr)
+    print("=" * 80, file=sys.stderr)
+    print(file=sys.stderr)
     
     # Display configuration
-    print("Configuration:")
-    print(f"  Workspace Directory: {WORKSPACE_DIR}")
-    print(f"  Default Timeout: {DEFAULT_TIMEOUT}s")
-    print(f"  HTTP Mode: {'Enabled' if args.http else 'Disabled'}")
+    print("Configuration:", file=sys.stderr)
+    print(f"  Workspace Directory: {WORKSPACE_DIR}", file=sys.stderr)
+    print(f"  Default Timeout: {DEFAULT_TIMEOUT}s", file=sys.stderr)
+    print(f"  HTTP Mode: {'Enabled' if args.http else 'Disabled'}", file=sys.stderr)
     if args.http:
-        print(f"  HTTP Port: {args.port}")
-    print()
+        print(f"  HTTP Port: {args.port}", file=sys.stderr)
+    print(file=sys.stderr)
     
     # Perform initial health check
-    print("Performing initial health check...")
+    print("Performing initial health check...", file=sys.stderr)
     try:
         import asyncio
         health_result = asyncio.run(health_check())
         
         if health_result.get("server_status") == "running":
-            print("Server Status: Running")
+            print("Server Status: Running", file=sys.stderr)
         else:
-            print("Server Status: Error")
+            print("Server Status: Error", file=sys.stderr)
         
         if health_result.get("apktool_available"):
-            print(f"APKTool Available: {health_result.get('apktool_version', 'Version unknown')}")
+            print(f"APKTool Available: {health_result.get('apktool_version', 'Version unknown')}", file=sys.stderr)
         else:
-            print("APKTool Not Available")
-            print(f"Error: {health_result.get('apktool_error', 'Unknown error')}")
+            print("APKTool Not Available", file=sys.stderr)
+            print(f"Error: {health_result.get('apktool_error', 'Unknown error')}", file=sys.stderr)
         
         if health_result.get("workspace_exists"):
-            print(f"Workspace Directory: {WORKSPACE_DIR}")
+            print(f"Workspace Directory: {WORKSPACE_DIR}", file=sys.stderr)
         else:
-            print(f"Workspace Directory: {WORKSPACE_DIR} (will be created)")
+            print(f"Workspace Directory: {WORKSPACE_DIR} (will be created)", file=sys.stderr)
             os.makedirs(WORKSPACE_DIR, exist_ok=True)
         
         # Get workspace info
         workspace_result = asyncio.run(get_workspace_info())
         if workspace_result.get("success"):
             info = workspace_result["workspace_info"]
-            print(f"Workspace Projects: {info.get('total_projects', 0)} total")
-            print(f"APKTool Projects: {info.get('apktool_projects', 0)}")
+            print(f"Workspace Projects: {info.get('total_projects', 0)} total", file=sys.stderr)
+            print(f"APKTool Projects: {info.get('apktool_projects', 0)}", file=sys.stderr)
             
             if info.get("free_space"):
                 free_gb = info["free_space"] / (1024**3)
-                print(f"  Free Space: {free_gb:.1f} GB")
+                print(f"  Free Space: {free_gb:.1f} GB", file=sys.stderr)
         
     except Exception as e:
-        print(f"Health check failed: {e}")
+        print(f"Health check failed: {e}", file=sys.stderr)
     
-    print()
-    print("Available MCP Tools:")
+    print(file=sys.stderr)
+    print("Available MCP Tools:", file=sys.stderr)
     tools = [
         "health_check", "decode_apk", "build_apk", "get_manifest", 
         "get_apktool_yml", "list_smali_directories", "list_smali_files", 
@@ -1851,16 +1852,16 @@ def main():
     ]
     
     for i, tool in enumerate(tools, 1):
-        print(f"  {i:2d}. {tool}")
+        print(f"  {i:2d}. {tool}", file=sys.stderr)
     
-    print()
-    print("Starting MCP server...")
+    print(file=sys.stderr)
+    print("Starting MCP server...", file=sys.stderr)
     
     if args.http:
-        print(f"Server will be available at: http://127.0.0.1:{args.port}")
+        print(f"Server will be available at: http://127.0.0.1:{args.port}", file=sys.stderr)
         mcp.run(transport="streamable-http", port=args.port)
     else:
-        print("Server running in stdio mode")
+        print("Server running in stdio mode", file=sys.stderr)
         mcp.run()
 
 if __name__ == "__main__":

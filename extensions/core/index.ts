@@ -9,16 +9,20 @@ import {
   isToolCallEventType,
   loadSkillsFromDir,
 } from "@earendil-works/pi-coding-agent";
+import { isRemoteExecutionActive } from "../../src/shared/execution.ts";
 import {
   showCyberModeSelector,
   showCyberProjectSelector,
 } from "../../src/shared/cyber-selector.ts";
+import { enterModeWithTarget } from "../../src/shared/engage.ts";
 import {
   CYBER_MODES,
+  CYBER_MODE_COMMANDS,
   CYBER_MODE_EVENT,
   CYBER_ONLY_COMMANDS,
   CYBER_STATUS_KEY,
   CYBER_WORKSPACE_EVENT,
+  getActiveCyberMode,
   isCyberModeActive,
   isCyberModeId,
   setCyberStatusLabel,
@@ -30,6 +34,8 @@ import {
   CYBER_WORKSPACE_ENTRY_TYPE,
   createCyberWorkspace,
   formatWorkspacePromptSection,
+  getActiveCyberWorkspace,
+  getCyberWorkspaceRoot,
   isCyberWorkspaceDir,
   listCyberProjects,
   loadCyberWorkspaceFromDir,
@@ -38,6 +44,7 @@ import {
   readManifest,
   reconstructWorkspaceFromSession,
   resolvePathInWorkspace,
+  setActiveCyberWorkspace,
   updateManifestActiveMode,
   type CyberWorkspaceState,
 } from "../../src/shared/workspace.ts";
@@ -46,12 +53,18 @@ const PATH_REDIRECT_TOOLS = new Set(["read", "write", "edit", "ls", "find", "gre
 const SKILLS_DIR = join(dirname(fileURLToPath(import.meta.url)), "../../skills");
 const CYBER_ONLY_COMMAND_NAMES = new Set<string>(CYBER_ONLY_COMMANDS);
 
-function isCyberOnlySuggestion(value: string): boolean {
-  if (CYBER_ONLY_COMMAND_NAMES.has(value)) return true;
-  return value.startsWith("skill:pentest")
-    || value.startsWith("skill:reverse")
-    || value.startsWith("skill:attribution")
-    || value.startsWith("skill:remediation");
+const MODE_IDS = Object.keys(CYBER_MODES) as CyberModeId[];
+
+/** Slash-command / skill suggestions that must not show for the current mode (or no mode). */
+function isHiddenSuggestion(value: string, mode: CyberModeId | null): boolean {
+  if (mode === null) {
+    return (
+      CYBER_ONLY_COMMAND_NAMES.has(value) || MODE_IDS.some((id) => value.startsWith(`skill:${id}`))
+    );
+  }
+  const owner = CYBER_MODE_COMMANDS[value];
+  if (owner && owner !== mode) return true;
+  return MODE_IDS.some((id) => id !== mode && value.startsWith(`skill:${id}`));
 }
 
 const hideCyberCommands: AutocompleteProviderFactory = (provider) => {
@@ -59,15 +72,16 @@ const hideCyberCommands: AutocompleteProviderFactory = (provider) => {
     triggerCharacters: provider.triggerCharacters,
     getSuggestions: async (lines, cursorLine, cursorCol, options) => {
       const result = await provider.getSuggestions(lines, cursorLine, cursorCol, options);
-      if (!result || isCyberModeActive()) return result;
-      const items = result.items.filter((item) => !isCyberOnlySuggestion(item.value));
+      if (!result) return result;
+      const mode = getActiveCyberMode();
+      const items = result.items.filter((item) => !isHiddenSuggestion(item.value, mode));
       return items.length === result.items.length ? result : { ...result, items };
     },
     applyCompletion: (lines, cursorLine, cursorCol, item, prefix) =>
       provider.applyCompletion(lines, cursorLine, cursorCol, item, prefix),
     shouldTriggerFileCompletion: provider.shouldTriggerFileCompletion?.bind(provider),
   };
-}
+};
 
 /**
  * Core extension: unified `/cyber` workspace control + cross-mode path redirect / prompt.
@@ -80,6 +94,7 @@ export default function (pi: ExtensionAPI) {
 
   const bindWorkspace = (ctx: ExtensionContext, workspace: CyberWorkspaceState, persist: boolean) => {
     activeWorkspace = workspace;
+    setActiveCyberWorkspace(workspace);
     lastCtx = ctx;
     if (persist) {
       pi.appendEntry(CYBER_WORKSPACE_ENTRY_TYPE, workspace);
@@ -95,6 +110,7 @@ export default function (pi: ExtensionAPI) {
     if (!activeWorkspace && isCyberWorkspaceDir(ctx.cwd)) {
       activeWorkspace = loadCyberWorkspaceFromDir(ctx.cwd);
     }
+    setActiveCyberWorkspace(activeWorkspace);
     if (activeWorkspace) {
       pi.events.emit(CYBER_WORKSPACE_EVENT, activeWorkspace);
     }
@@ -120,6 +136,7 @@ export default function (pi: ExtensionAPI) {
   pi.events.on(CYBER_WORKSPACE_EVENT, (data) => {
     const workspace = data as CyberWorkspaceState | null;
     activeWorkspace = workspace;
+    setActiveCyberWorkspace(workspace);
     if (activeMode) {
       safeSetStatus(
         activeMode,
@@ -129,13 +146,20 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.events.on(CYBER_MODE_EVENT, (data) => {
-    const nextMode = data as CyberModeId | null;
+    const payload =
+      data && typeof data === "object" && "mode" in data
+        ? (data as { mode: CyberModeId | null; skipManifestUpdate?: boolean })
+        : { mode: data as CyberModeId | null, skipManifestUpdate: false };
+    const nextMode = payload.mode;
     activeMode = nextMode;
-    if (activeWorkspace) {
-      updateManifestActiveMode(activeWorkspace.workspaceDir, nextMode);
+    const ws = activeWorkspace ?? getActiveCyberWorkspace();
+    if (ws) {
+      if (!payload.skipManifestUpdate) {
+        updateManifestActiveMode(ws.workspaceDir, nextMode);
+      }
       safeSetStatus(
         nextMode,
-        nextMode ? basename(activeWorkspace.workspaceDir) : undefined,
+        nextMode ? basename(ws.workspaceDir) : undefined,
       );
     }
   });
@@ -147,18 +171,23 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.addAutocompleteProvider(hideCyberCommands);
     }
     reconstructWorkspace(ctx);
-    if (activeWorkspace && activeWorkspace.workspaceDir === ctx.cwd) {
-      const manifest = readManifest(activeWorkspace.workspaceDir);
-      if (manifest?.activeMode && isCyberModeId(manifest.activeMode)) {
-        await switchCyberMode(pi, ctx, manifest.activeMode, {
-          engagementName: basename(activeWorkspace.workspaceDir),
-          silent: true,
-        });
-      } else {
-        setCyberStatusLabel(ctx, null);
+    const atWorkspace = activeWorkspace && activeWorkspace.workspaceDir === ctx.cwd ? activeWorkspace : null;
+    const manifest = atWorkspace ? readManifest(atWorkspace.workspaceDir) : null;
+    if (atWorkspace && manifest?.activeMode && isCyberModeId(manifest.activeMode)) {
+      await switchCyberMode(pi, ctx, manifest.activeMode, {
+        engagementName: basename(atWorkspace.workspaceDir),
+        silent: true,
+      });
+    } else {
+      // The mode flag is process-wide. A session that has no mode to restore (a plain session,
+      // another directory, /resume, /new) must not inherit it from the previous one.
+      if (isCyberModeActive()) {
+        await switchCyberMode(pi, ctx, null, { silent: true, skipManifestUpdate: true });
+      }
+      if (atWorkspace) {
         ctx.ui.setStatus(
           CYBER_STATUS_KEY,
-          `Cyber: 工作区 (${basename(activeWorkspace.workspaceDir)})`,
+          `Cyber: 工作区 (${basename(atWorkspace.workspaceDir)})`,
         );
       }
     }
@@ -175,11 +204,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (event) => {
+    // Outside a working mode the session is a normal one: no workspace context, no skills.
+    if (!activeMode) return;
     if (activeWorkspace) {
       event.systemPromptOptions.sections["cyber-workspace"] =
         formatWorkspacePromptSection(activeWorkspace);
     }
-    if (!activeMode) return;
     const loaded = loadSkillsFromDir({
       dir: join(SKILLS_DIR, activeMode),
       source: "pi-cyber",
@@ -189,11 +219,13 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
-    if (!activeWorkspace) return;
+    if (!activeMode || !activeWorkspace) return;
     if (activeWorkspace.workspaceDir === ctx.cwd) return;
 
     if (isToolCallEventType("bash", event)) {
-      event.input.command = `cd ${quoteShellPath(activeWorkspace.workspaceDir)} && ${event.input.command}`;
+      if (!isRemoteExecutionActive()) {
+        event.input.command = `cd ${quoteShellPath(activeWorkspace.workspaceDir)} && ${event.input.command}`;
+      }
       return;
     }
 
@@ -205,17 +237,46 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("cyber", {
     description:
-      "Cyber 工作区总控: /cyber 选择项目→模式；或 [name | pentest|… | off]",
+      "Cyber 工作区总控: /cyber 选择项目→模式；或 [name | pentest|… | reverse <样本路径> | off]",
     handler: async (args, ctx) => {
       lastCtx = ctx;
       const raw = args.trim();
       const target = raw.toLowerCase();
+      const firstWord = raw.split(/\s+/)[0] ?? "";
+      const restArg = raw.slice(firstWord.length).trim();
 
       if (target === "off" || target === "none") {
         if (activeWorkspace) {
           updateManifestActiveMode(activeWorkspace.workspaceDir, null);
         }
         await switchCyberMode(pi, ctx, null);
+        return;
+      }
+
+      if (restArg && isCyberModeId(firstWord.toLowerCase())) {
+        const mode = firstWord.toLowerCase() as CyberModeId;
+        if (mode !== "reverse") {
+          ctx.ui.notify(
+            `「${CYBER_MODES[mode].label}」模式不接受路径参数。用法: /cyber ${mode}，或 /cyber reverse <样本路径>`,
+            "warning",
+          );
+          return;
+        }
+        try {
+          await enterModeWithTarget(pi, ctx, mode, restArg, (ws) => bindWorkspace(ctx, ws, false));
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          try {
+            ctx.ui.notify(`登记逆向目标失败: ${message}`, "error");
+          } catch {
+            /* ignore stale ctx after successful switchSession */
+          }
+        }
+        return;
+      }
+
+      if (isCyberModeId(target) && !CYBER_MODES[target].implemented) {
+        ctx.ui.notify(`「${CYBER_MODES[target].label}」模式还没有实现。`, "warning");
         return;
       }
 
@@ -273,8 +334,8 @@ async function openCyberWizard(
     ) => void;
   },
 ): Promise<void> {
-  const scanRoot = state.activeWorkspace?.rootCwd ?? ctx.cwd;
-  const projects = listCyberProjects(scanRoot);
+  const launchRoot = state.activeWorkspace?.rootCwd ?? ctx.cwd;
+  const projects = listCyberProjects(getCyberWorkspaceRoot(), launchRoot);
 
   const projectChoice = await showCyberProjectSelector(ctx, projects, {
     currentWorkspaceDir: state.activeWorkspace?.workspaceDir ?? null,
@@ -312,9 +373,7 @@ async function openCyberWizard(
     return;
   }
 
-  const ws =
-    loadCyberWorkspaceFromDir(projectChoice.workspaceDir, scanRoot) ??
-    loadCyberWorkspaceFromDir(projectChoice.workspaceDir);
+  const ws = loadCyberWorkspaceFromDir(projectChoice.workspaceDir, launchRoot);
   if (!ws) {
     ctx.ui.notify(`无法加载项目: ${projectChoice.workspaceDir}`, "error");
     return;
@@ -388,7 +447,7 @@ async function createAndMigrate(
   ) => void,
   mode?: CyberModeId,
 ): Promise<void> {
-  const workspace = createCyberWorkspace(ctx.cwd, engagementName);
+  const workspace = createCyberWorkspace(getCyberWorkspaceRoot(), engagementName, new Date(), ctx.cwd);
   if (mode) {
     updateManifestActiveMode(workspace.workspaceDir, mode);
   }

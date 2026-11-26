@@ -18,7 +18,7 @@ import { basename } from "node:path";
 import { CYBER_MODES, type CyberModeId, isCyberModeId } from "./mode.ts";
 import type { CyberProjectInfo } from "./workspace.ts";
 
-const SELECT_LIST_LAYOUT = {
+const DEFAULT_SELECT_LIST_LAYOUT = {
   minPrimaryColumnWidth: 14,
   maxPrimaryColumnWidth: 36,
 };
@@ -41,6 +41,7 @@ class SearchSelectComponent extends Container implements Focusable {
   private selectList: SelectList;
   private selectListChildIndex: number;
   private allItems: SelectItem[];
+  private listLayout: { minPrimaryColumnWidth: number; maxPrimaryColumnWidth: number };
   private onSelect: (value: string) => void;
   private onCancel: () => void;
   private _focused = false;
@@ -59,6 +60,7 @@ class SearchSelectComponent extends Container implements Focusable {
     subtitle: string | undefined,
     items: SelectItem[],
     preselect: string | undefined,
+    listLayout: { minPrimaryColumnWidth: number; maxPrimaryColumnWidth: number },
     onSelect: (value: string) => void,
     onCancel: () => void,
   ) {
@@ -66,6 +68,7 @@ class SearchSelectComponent extends Container implements Focusable {
     this.onSelect = onSelect;
     this.onCancel = onCancel;
     this.allItems = items;
+    this.listLayout = listLayout;
 
     this.addChild(new DynamicBorder());
     this.addChild(new Spacer(1));
@@ -94,7 +97,7 @@ class SearchSelectComponent extends Container implements Focusable {
       items,
       Math.min(Math.max(1, items.length), 12),
       getSelectListTheme(),
-      SELECT_LIST_LAYOUT,
+      this.listLayout,
     );
     const currentIndex = items.findIndex((item) => item.value === preselect);
     if (currentIndex !== -1) {
@@ -137,7 +140,7 @@ class SearchSelectComponent extends Container implements Focusable {
   }
 }
 
-async function showSearchSelect(
+export async function showSearchSelect(
   ctx: ExtensionContext,
   options: {
     title: string;
@@ -145,6 +148,7 @@ async function showSearchSelect(
     items: SelectItem[];
     preselect?: string;
     fallbackLabels: string[];
+    listLayout?: { minPrimaryColumnWidth: number; maxPrimaryColumnWidth: number };
   },
 ): Promise<string | null> {
   if (ctx.mode !== "tui") {
@@ -167,6 +171,7 @@ async function showSearchSelect(
       options.subtitle,
       options.items,
       options.preselect,
+      options.listLayout ?? DEFAULT_SELECT_LIST_LAYOUT,
       (v) => done(v),
       () => done(null),
     );
@@ -269,7 +274,8 @@ export async function showCyberModeSelector(
     currentMode?: CyberModeId | null;
   },
 ): Promise<CyberModeChoice> {
-  const items: SelectItem[] = Object.values(CYBER_MODES).map((meta) => {
+  const selectable = Object.values(CYBER_MODES).filter((meta) => meta.implemented);
+  const items: SelectItem[] = selectable.map((meta) => {
     const active = options?.currentMode === meta.id;
     return {
       value: meta.id,
@@ -283,7 +289,7 @@ export async function showCyberModeSelector(
     subtitle: options?.projectLabel ? `项目: ${options.projectLabel}` : undefined,
     items,
     preselect: options?.currentMode ?? undefined,
-    fallbackLabels: Object.values(CYBER_MODES).map((meta) => {
+    fallbackLabels: selectable.map((meta) => {
       const mark = options?.currentMode === meta.id ? "✓ " : "";
       return `${mark}${meta.id} — ${meta.label} — ${meta.description}`;
     }),
