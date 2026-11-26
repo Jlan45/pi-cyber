@@ -10,6 +10,7 @@ import {
   loadSkillsFromDir,
 } from "@earendil-works/pi-coding-agent";
 import { isRemoteExecutionActive } from "../../src/shared/execution.ts";
+import { playCyberEnterAnimation } from "../../src/shared/enter-animation.ts";
 import {
   showCyberModeSelector,
   showCyberProjectSelector,
@@ -422,6 +423,11 @@ async function openExistingProject(
   const migratedSessionFile = migrateSessionToWorkspace(ctx.sessionManager, workspace);
   const result = await ctx.switchSession(migratedSessionFile, {
     withSession: async (newCtx: ExtensionCommandContext) => {
+      try {
+        await playCyberEnterAnimation(newCtx, mode, workspaceName);
+      } catch {
+        /* animation must not fail the handoff */
+      }
       newCtx.ui.notify(
         `已切换至 Cyber 项目: ${workspaceName} · ${CYBER_MODES[mode].label}`,
         "info",
@@ -457,6 +463,13 @@ async function createAndMigrate(
 
   const result = await ctx.switchSession(migratedSessionFile, {
     withSession: async (newCtx: ExtensionCommandContext) => {
+      if (mode) {
+        try {
+          await playCyberEnterAnimation(newCtx, mode, workspaceName);
+        } catch {
+          /* animation must not fail the handoff */
+        }
+      }
       newCtx.ui.notify(
         mode
           ? `已创建并进入: ${workspaceName} · ${CYBER_MODES[mode].label} (${workspaceDir})`
